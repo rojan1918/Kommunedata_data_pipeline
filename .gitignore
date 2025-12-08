@@ -1,0 +1,16 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+.env
+
+# Downloaded files (We don't want to upload PDFs)
+referater_*/
+downloads/
+*.pdf
+
+# System files
+.DS_Store

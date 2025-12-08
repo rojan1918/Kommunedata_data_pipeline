@@ -1,0 +1,277 @@
+import os
+import re
+import time
+import csv
+import pandas as pd
+from glob import glob
+from urllib.parse import urlparse
+
+# Import Selenium
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.common.exceptions import TimeoutException
+except ImportError:
+    print("Error: Selenium library not found. Run: pip install selenium")
+    exit()
+
+# Import BeautifulSoup
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    print("Error: BeautifulSoup library not found. Run: pip install beautifulsoup4")
+    exit()
+
+# --- CONFIGURATION ---
+INPUT_FILE = 'found_start_urls.csv'  # The file containing the links
+MAX_DOWNLOADS = 1  # Set to None for "everything", or an integer (e.g. 10) for a limit
+BASE_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+}
+
+
+def get_driver(download_dir):
+    """
+    Initializes a new driver for each municipality to ensure
+    downloads go to the correct specific folder.
+    """
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")  # Run in background
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+
+    # Configure download folder dynamically
+    prefs = {
+        "download.default_directory": download_dir,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "plugins.always_open_pdf_externally": True
+    }
+    chrome_options.add_experimental_option("prefs", prefs)
+
+    driver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
+    if not os.path.exists(driver_path):
+        driver_path = 'chromedriver'  # Fallback
+
+    service = Service(executable_path=driver_path)
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    return driver
+
+
+def get_meeting_links(driver, start_url, base_url):
+    """
+    Scrapes meeting links using infinite scroll.
+    Respects the global MAX_DOWNLOADS limit to stop scrolling early if possible.
+    """
+    print(f"   > Finding Meeting Pages on {start_url}...")
+    driver.get(start_url)
+
+    try:
+        # Wait for the first link to ensure page loaded
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "a[href^='/vis?Referat-']"))
+        )
+    except TimeoutException:
+        print("   > Warning: Page loaded but no meeting links found (or timed out).")
+        return []
+
+    seen_links = set()
+    ordered_links = []
+    last_total_count = 0
+
+    while True:
+        # Parse current page state
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        links = soup.find_all('a', href=lambda h: h and h.startswith('/vis?Referat-'))
+
+        for link in links:
+            href = link.get('href')
+            # Ensure we construct the full URL using the correct Base URL
+            full_url = base_url.rstrip('/') + href if href.startswith('/') else base_url + '/' + href
+
+            if full_url not in seen_links:
+                seen_links.add(full_url)
+                ordered_links.append(full_url)
+
+                # Optimization: If we have a limit, stop collecting once we reach it
+                if MAX_DOWNLOADS and len(ordered_links) >= MAX_DOWNLOADS:
+                    print(f"   > Reached limit of {MAX_DOWNLOADS} meetings.")
+                    return ordered_links
+
+        print(f"   > Found {len(ordered_links)} unique links so far...")
+
+        if len(ordered_links) == last_total_count:
+            print("   > No new links loaded. Finished scrolling.")
+            break
+
+        last_total_count = len(ordered_links)
+
+        # Scroll down
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2.5)
+
+    return ordered_links
+
+
+def process_download(driver, meeting_url, base_url, download_dir, muni_name):
+    """
+    Downloads a single PDF.
+    Uses the dynamic base_url to construct the download link.
+    """
+    try:
+        # Extract UUID
+        uuid_match = re.search(r"id=([a-f0-9\-]{36})", meeting_url)
+        if not uuid_match:
+            print(f"     Skipping (No UUID found): {meeting_url}")
+            return
+        uuid = uuid_match.group(1)
+
+        # Determine Date for filename
+        date_match = re.search(r'd\.(\d{2}-\d{2}-\d{4})', meeting_url)
+        if date_match:
+            d, m, y = date_match.group(1).split('-')
+            filename = f"{y}-{m}-{d}_{muni_name}_oekonomiudvalget.pdf"
+        else:
+            filename = f"{muni_name}_oekonomiudvalget_{uuid}.pdf"
+
+        final_path = os.path.join(download_dir, filename)
+        if os.path.exists(final_path):
+            # print(f"     Skipping (Exists): {filename}")
+            return
+
+        # Construct Direct Download Link
+        # Note: We use the specific base_url for this municipality
+        direct_download_url = f"{base_url.rstrip('/')}/pdf/GetDagsorden/{uuid}"
+
+        # Snapshot for detection
+        files_before = set(glob(os.path.join(download_dir, "*.pdf")))
+
+        print(f"     Downloading: {filename} ...")
+        try:
+            driver.get(direct_download_url)
+        except Exception as e:
+            print(f"     > Browser error: {e}")
+            return
+
+        # Wait for file
+        timeout = time.time() + 60
+        downloaded_file = None
+
+        while time.time() < timeout:
+            files_now = set(glob(os.path.join(download_dir, "*.pdf")))
+            new_files = files_now - files_before
+
+            if new_files:
+                potential_file = new_files.pop()
+                if not potential_file.endswith(".crdownload"):
+                    downloaded_file = potential_file
+                    break
+            time.sleep(0.5)
+
+        # Rename
+        if downloaded_file:
+            try:
+                time.sleep(1)  # Release handle
+                os.rename(downloaded_file, final_path)
+                print(f"     > Success!")
+            except Exception as e:
+                print(f"     > Error renaming: {e}")
+        else:
+            print("     > Timeout waiting for file.")
+
+    except Exception as e:
+        print(f"     Error processing URL: {e}")
+
+
+def get_municipalities_from_file():
+    """Reads the CSV file and returns a list of dicts."""
+    municipalities = []
+    try:
+        # Try reading with pandas if available (more robust CSV parsing)
+        df = pd.read_csv(INPUT_FILE)
+        for _, row in df.iterrows():
+            municipalities.append({
+                'base_url': row['Base URL'].strip(),
+                'start_url': row['Start URL'].strip()
+            })
+    except Exception:
+        # Fallback to standard CSV
+        with open(INPUT_FILE, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                municipalities.append({
+                    'base_url': row['Base URL'].strip(),
+                    'start_url': row['Start URL'].strip()
+                })
+    return municipalities
+
+
+def extract_name_from_url(url):
+    """Extracts 'esbjerg' from 'https://dagsordener.esbjergkommune.dk'"""
+    domain = urlparse(url).netloc
+    # Remove 'dagsordener.' and '.dk'
+    name = domain.replace('dagsorden.', '').replace('dagsordener.', '').replace('.dk', '')
+    # Remove 'kommune' if present to keep it short
+    name = name.replace('kommune', '')
+    return name
+
+
+# --- MAIN ORCHESTRATOR ---
+def run_scraper():
+    print(f"--- Starting Multi-Municipality Scraper ---")
+    print(f"Reading from: {INPUT_FILE}")
+    print(f"Download Limit: {MAX_DOWNLOADS if MAX_DOWNLOADS else 'Unlimited'}")
+
+    targets = get_municipalities_from_file()
+    print(f"Found {len(targets)} municipalities to process.\n")
+
+    for target in targets:
+        base_url = target['base_url']
+        start_url = target['start_url']
+
+        # Generate a folder name based on the URL (e.g., raw_files_esbjerg)
+        muni_name = extract_name_from_url(base_url)
+        download_dir = os.path.abspath(f"raw_files_{muni_name}")
+        os.makedirs(download_dir, exist_ok=True)
+
+        print(f"[*] Processing: {muni_name.upper()}")
+        print(f"    Folder: {download_dir}")
+
+        # Start a fresh driver for this municipality to ensure clean download folder
+        driver = get_driver(download_dir)
+
+        try:
+            # 1. Get Links
+            meeting_links = get_meeting_links(driver, start_url, base_url)
+
+            if not meeting_links:
+                print("    No links found. Skipping.")
+                continue
+
+            # Apply limit if set
+            if MAX_DOWNLOADS:
+                meeting_links = meeting_links[:MAX_DOWNLOADS]
+
+            print(f"    Processing {len(meeting_links)} files...")
+
+            # 2. Download Loop
+            for i, link in enumerate(meeting_links):
+                print(f"    [{i + 1}/{len(meeting_links)}]", end="")
+                process_download(driver, link, base_url, download_dir, muni_name)
+
+        except Exception as e:
+            print(f"    Critical error for {muni_name}: {e}")
+        finally:
+            driver.quit()
+
+        print(f"    Finished {muni_name}.\n")
+
+    print("--- All Jobs Complete ---")
+
+
+if __name__ == "__main__":
+    run_scraper()
