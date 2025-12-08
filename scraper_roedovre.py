@@ -5,7 +5,8 @@ import base64
 import json
 import platform
 
-# Import Selenium
+# --- LIBRARIES ---
+# Selenium for scraping
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.service import Service
@@ -18,6 +19,13 @@ except ImportError:
     print("Error: Selenium library not found. Run: pip install selenium")
     exit()
 
+# Boto3 for Wasabi/S3
+try:
+    import boto3
+    from botocore.exceptions import NoCredentialsError
+except ImportError:
+    print("Warning: boto3 not found. Cloud upload will fail if running on Render. (pip install boto3)")
+
 # --- CONFIGURATION ---
 # Detect if we are running on Render
 IS_RENDER = os.environ.get('RENDER') == 'true'
@@ -25,47 +33,77 @@ IS_RENDER = os.environ.get('RENDER') == 'true'
 BASE_URL = "https://www.rk.dk"
 START_URL = "https://www.rk.dk/politik/politiske-udvalg/oekonomiudvalget"
 
+# Wasabi Configuration (Only needed if on Render)
+WASABI_ACCESS_KEY = os.environ.get("WASABI_ACCESS_KEY")
+WASABI_SECRET_KEY = os.environ.get("WASABI_SECRET_KEY")
+WASABI_BUCKET = "raw-files-roedovre"
+WASABI_ENDPOINT = os.environ.get("WASABI_ENDPOINT", "https://s3.eu-central-1.wasabisys.com")
+
 if IS_RENDER:
     # 1. RENDER CONFIGURATION
-    # Render persistent disks are usually mounted at /var/data (or whatever you named it)
-    # We use an env var 'RENDER_DISK_PATH' or default to '/var/data'
-    disk_path = os.environ.get('RENDER_DISK_PATH', '/var/data')
-    DOWNLOAD_DIR = os.path.join(disk_path, 'referater_roedovre')
-    print(f"--- RUNNING ON RENDER ---")
-    print(f"Saving files to Persistent Disk: {DOWNLOAD_DIR}")
+    # We use /tmp because we only need to hold the file for 2 seconds before uploading
+    DOWNLOAD_DIR = "/tmp"
+    print(f"--- RUNNING ON RENDER (CLOUD MODE) ---")
+    print(f"Temp storage: {DOWNLOAD_DIR}")
+    print(f"Target Storage: Wasabi Bucket '{WASABI_BUCKET}'")
 else:
-    # 2. LOCAL CONFIGURATION (Windows/Mac)
+    # 2. LOCAL CONFIGURATION
     DOWNLOAD_DIR = os.path.abspath('raw_files_roedovre')
     print(f"--- RUNNING LOCALLY ---")
     print(f"Saving files to Local Folder: {DOWNLOAD_DIR}")
 
 
+# --- WASABI UPLOAD HELPER ---
+def upload_to_wasabi(local_file_path, remote_filename):
+    """
+    Uploads a file to Wasabi and returns True if successful.
+    """
+    if not WASABI_ACCESS_KEY or not WASABI_SECRET_KEY:
+        print("   > Error: Wasabi credentials missing.")
+        return False
+
+    s3 = boto3.client(
+        's3',
+        endpoint_url=WASABI_ENDPOINT,
+        aws_access_key_id=WASABI_ACCESS_KEY,
+        aws_secret_access_key=WASABI_SECRET_KEY
+    )
+
+    try:
+        # Check if file already exists in Wasabi to save time
+        try:
+            s3.head_object(Bucket=WASABI_BUCKET, Key=remote_filename)
+            print(f"   > Skipping: {remote_filename} already exists in Wasabi.")
+            return "EXISTS"
+        except:
+            pass  # File does not exist, proceed
+
+        print(f"   > Uploading to Wasabi...")
+        with open(local_file_path, "rb") as f:
+            s3.put_object(Bucket=WASABI_BUCKET, Key=remote_filename, Body=f)
+
+        print(f"   > Upload Success!")
+        return True
+
+    except Exception as e:
+        print(f"   > Wasabi Upload Error: {e}")
+        return False
+
+
 # --- SETUP SELENIUM ---
 def get_driver():
     chrome_options = Options()
-
-    # --- SHARED OPTIONS ---
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument('--kiosk-printing')
 
-    # --- ENVIRONMENT SPECIFIC OPTIONS ---
     if IS_RENDER:
-        # Render MUST be headless
         chrome_options.add_argument("--headless=new")
-    else:
-        # Local: You might want to see the browser (comment out to run headless locally)
-        # chrome_options.add_argument("--headless=new")
-        pass
 
-    # Print settings (Required for Page.printToPDF in some versions)
+    # Print settings
     settings = {
-        "recentDestinations": [{
-            "id": "Save as PDF",
-            "origin": "local",
-            "account": "",
-        }],
+        "recentDestinations": [{"id": "Save as PDF", "origin": "local", "account": ""}],
         "selectedDestinationId": "Save as PDF",
         "version": 2
     }
@@ -75,30 +113,22 @@ def get_driver():
     }
     chrome_options.add_experimental_option('prefs', prefs)
 
-    # --- DRIVER PATH FINDER ---
+    # Driver Path Logic
     driver_path = None
-
     if IS_RENDER:
-        # On Render (Linux), chromedriver is usually in the path
         driver_path = "/usr/bin/chromedriver"
         if not os.path.exists(driver_path):
             driver_path = "/usr/local/bin/chromedriver"
     elif platform.system() == "Windows":
-        # Local Windows
         driver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
     else:
-        # Local Mac/Linux
-        driver_path = 'chromedriver'
-
-    # Fallback checks
-    if driver_path and not os.path.exists(driver_path) and not IS_RENDER:
-        # On local, if specific path fails, try simple command
         driver_path = 'chromedriver'
 
     print(f"Starting Chrome with Driver: {driver_path}")
 
     try:
-        service = Service(executable_path=driver_path) if driver_path else Service()
+        service = Service(executable_path=driver_path) if driver_path and os.path.exists(
+            str(driver_path)) else Service()
         driver = webdriver.Chrome(service=service, options=chrome_options)
         return driver
     except Exception as e:
@@ -108,45 +138,28 @@ def get_driver():
 
 # --- COOKIE BANNER HANDLER ---
 def handle_cookies(driver):
-    """
-    Detects and clicks 'Accepter' or 'Afvis' on the cookie banner.
-    """
     try:
-        # Wait up to 3 seconds for a cookie banner
         wait = WebDriverWait(driver, 3)
         xpath = "//button[contains(text(), 'Afvis alle') or contains(text(), 'Accepter alle') or contains(text(), 'Tillad alle')]"
         button = wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
-
         if button:
-            print("   > Cookie banner found. Clicking...")
             driver.execute_script("arguments[0].click();", button)
-            time.sleep(2)
-            return True
-
-    except TimeoutException:
+            time.sleep(1)
+    except:
         pass
-    except Exception as e:
-        print(f"   > Warning: Cookie handler issue: {e}")
 
 
-# --- HELPER: PRINT TO PDF ---
+# --- PRINT TO PDF ---
 def print_page_to_pdf(driver, output_path):
     try:
-        # Use Selenium's DevTools command for printing
         pdf_data = driver.execute_cdp_cmd("Page.printToPDF", {
             "printBackground": True,
             "paperWidth": 8.27,
             "paperHeight": 11.69,
-            "marginTop": 0.4,
-            "marginBottom": 0.4,
-            "marginLeft": 0.4,
-            "marginRight": 0.4,
             "displayHeaderFooter": False
         })
-
         with open(output_path, "wb") as f:
             f.write(base64.b64decode(pdf_data['data']))
-
         return True
     except Exception as e:
         print(f"   > Error printing PDF: {e}")
@@ -155,9 +168,8 @@ def print_page_to_pdf(driver, output_path):
 
 # --- STEP 1: GET LINKS ---
 def get_meeting_links(driver):
-    print(f"--- Step 1: Getting Meeting List from {START_URL} ---")
+    print(f"--- Getting Meeting List ---")
     driver.get(START_URL)
-
     handle_cookies(driver)
 
     try:
@@ -165,7 +177,6 @@ def get_meeting_links(driver):
             EC.presence_of_element_located((By.CSS_SELECTOR, "section.section-box .link a"))
         )
     except:
-        print("Error: Could not find meeting list.")
         return []
 
     links = driver.find_elements(By.CSS_SELECTOR, "section.section-box .link a")
@@ -174,43 +185,55 @@ def get_meeting_links(driver):
     for link in links:
         href = link.get_attribute('href')
         text = link.get_attribute("textContent")
+        if text and href:
+            match = re.search(r"(\d{2})-(\d{2})-(\d{4})", text.strip())
+            if match:
+                d, m, y = match.groups()
+                meetings.append((href, f"{y}-{m}-{d}"))
 
-        if not text: continue
-        text = text.strip().lower()
-        if not href: continue
-
-        match = re.search(r"(\d{2})-(\d{2})-(\d{4})", text)
-        if match:
-            d, m, y = match.groups()
-            date_str = f"{y}-{m}-{d}"
-            meetings.append((href, date_str))
-
-    print(f"  > Found {len(meetings)} meetings.")
     return meetings
 
 
-# --- STEP 2: VISIT AND PRINT ---
+# --- STEP 2: PROCESS MEETING ---
 def process_meeting(driver, meeting_url, date_str):
     filename = f"{date_str}_roedovre_oekonomiudvalget.pdf"
-    final_path = os.path.join(DOWNLOAD_DIR, filename)
+    local_path = os.path.join(DOWNLOAD_DIR, filename)
 
-    if os.path.exists(final_path):
+    # 1. OPTIMIZATION: If on Render, check Wasabi BEFORE downloading
+    # This saves computing power by not scraping files we already have
+    if IS_RENDER:
+        s3 = boto3.client('s3', endpoint_url=WASABI_ENDPOINT, aws_access_key_id=WASABI_ACCESS_KEY,
+                          aws_secret_access_key=WASABI_SECRET_KEY)
+        try:
+            s3.head_object(Bucket=WASABI_BUCKET, Key=filename)
+            print(f"Skipping {filename} (Already in Wasabi)")
+            return
+        except:
+            pass  # File missing, continue to scrape
+
+    # 2. Check local file existence (for local runs)
+    elif os.path.exists(local_path):
+        print(f"Skipping {filename} (Exists locally)")
         return
 
     print(f"Processing: {filename} ...")
 
     try:
         driver.get(meeting_url)
-
-        # 1. Wait for content
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "h1")))
-
-        # 2. Handle Cookies
         handle_cookies(driver)
 
-        # 3. Print
-        if print_page_to_pdf(driver, final_path):
-            print("   > Success!")
+        # 3. Save PDF locally (to disk or /tmp)
+        if print_page_to_pdf(driver, local_path):
+
+            # 4. IF RENDER: Upload to Wasabi then delete local file
+            if IS_RENDER:
+                upload_result = upload_to_wasabi(local_path, filename)
+                # Cleanup: Remove the file from /tmp to save space
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+            else:
+                print("   > Saved locally.")
         else:
             print("   > Failed to print.")
 
@@ -220,7 +243,6 @@ def process_meeting(driver, meeting_url, date_str):
 
 # --- MAIN ---
 def run_roedovre_scraper():
-    # Ensure directory exists (Recursive for cloud paths)
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
     driver = get_driver()
@@ -228,15 +250,14 @@ def run_roedovre_scraper():
 
     try:
         meetings = get_meeting_links(driver)
+        print(f"Found {len(meetings)} meetings.")
 
-        print(f"\n--- Step 2: Printing {len(meetings)} pages to PDF ---")
         for i, (url, date) in enumerate(meetings):
-            print(f"[{i + 1}/{len(meetings)}]", end=" ")
             process_meeting(driver, url, date)
 
     finally:
         driver.quit()
-        print("\n--- Rødovre Scrape Complete! ---")
+        print("\n--- Complete! ---")
 
 
 if __name__ == "__main__":
