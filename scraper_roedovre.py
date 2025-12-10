@@ -91,17 +91,25 @@ def upload_to_wasabi(local_file_path, remote_filename):
 
 
 # --- SETUP SELENIUM ---
+# --- SETUP SELENIUM ---
 def get_driver():
     chrome_options = Options()
+
+    # --- SHARED OPTIONS ---
     chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--no-sandbox")  # CRITICAL for Docker
+    chrome_options.add_argument("--disable-dev-shm-usage")  # CRITICAL for Docker
     chrome_options.add_argument('--kiosk-printing')
 
+    # --- ENVIRONMENT SPECIFIC OPTIONS ---
     if IS_RENDER:
+        # 1. Run Headless
         chrome_options.add_argument("--headless=new")
 
-    # Print settings
+        # 2. POINT TO CHROMIUM BINARY (This is the missing link!)
+        chrome_options.binary_location = "/usr/bin/chromium"
+
+    # Print settings (Required for Page.printToPDF)
     settings = {
         "recentDestinations": [{"id": "Save as PDF", "origin": "local", "account": ""}],
         "selectedDestinationId": "Save as PDF",
@@ -113,18 +121,23 @@ def get_driver():
     }
     chrome_options.add_experimental_option('prefs', prefs)
 
-    # Driver Path Logic
+    # --- DRIVER PATH FINDER ---
     driver_path = None
+
     if IS_RENDER:
+        # On Render (Linux), chromedriver is usually in the path
         driver_path = "/usr/bin/chromedriver"
         if not os.path.exists(driver_path):
-            driver_path = "/usr/local/bin/chromedriver"
+            # Fallback for some Debian setups
+            driver_path = "/usr/lib/chromium/chromedriver"
     elif platform.system() == "Windows":
         driver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
     else:
         driver_path = 'chromedriver'
 
-    print(f"Starting Chrome with Driver: {driver_path}")
+    print(f"Starting Chrome...")
+    print(f"   Binary Location: {chrome_options.binary_location}")
+    print(f"   Driver Path: {driver_path}")
 
     try:
         service = Service(executable_path=driver_path) if driver_path and os.path.exists(
