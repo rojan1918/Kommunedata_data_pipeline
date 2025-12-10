@@ -1,10 +1,7 @@
 # Use Python 3.11-slim
 FROM python:3.11-slim
 
-# --- FORCE RENDER MODE ---
-ENV RENDER=true
-
-# 1. Install Chromium and Driver
+# 1. Install Chromium, Driver, and dependencies
 RUN apt-get update && apt-get install -y \
     chromium \
     chromium-driver \
@@ -12,14 +9,19 @@ RUN apt-get update && apt-get install -y \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Set Chrome Environment Variables
+# 2. Set Environment Variables so Selenium finds them automatically
 ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROME_DRIVER=/usr/bin/chromedriver
 
-# 3. Setup App
+# 3. Set work directory
 WORKDIR /app
+
+# 4. Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# 5. Copy script
 COPY scraper_roedovre.py .
 
+# 6. Run
 CMD ["python", "scraper_roedovre.py"]
