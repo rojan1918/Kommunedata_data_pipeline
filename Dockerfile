@@ -1,4 +1,4 @@
-# Use Python 3.9 (slim version to save space)
+# Use Python 3.11 (slim version to save space)
 FROM python:3.11-slim
 
 # 1. Install Chrome and Chromedriver
