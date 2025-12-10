@@ -1,22 +1,27 @@
-# Use Python 3.11 (slim version to save space)
+# Use Python 3.11-slim
 FROM python:3.11-slim
 
-# 1. Install Chrome and Chromedriver
-# We use Chromium because it's easier to install on Linux servers than Google Chrome
+# 1. Install Chromium, Driver, and dependencies
 RUN apt-get update && apt-get install -y \
     chromium \
     chromium-driver \
+    wget \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Set up the working directory
+# 2. Set Environment Variables so Selenium finds them automatically
+ENV CHROME_BIN=/usr/bin/chromium
+ENV CHROME_DRIVER=/usr/bin/chromedriver
+
+# 3. Set work directory
 WORKDIR /app
 
-# 3. Copy requirements and install them
+# 4. Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 4. Copy your script
+# 5. Copy script
 COPY scraper_roedovre.py .
 
-# 5. Command to run when the Cron Job starts
+# 6. Run
 CMD ["python", "scraper_roedovre.py"]
