@@ -6,10 +6,21 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from weasyprint import HTML
 
+# --- UTILS ---
+import scraper_utils
+
 # --- CONFIGURATION ---
-OUTPUT_DIR = os.path.abspath("referater_kobenhavn")
+IS_RENDER = os.environ.get('RENDER') == 'true'
 BASE_DOMAIN = "https://www.kk.dk"
 BASE_PATH = "/dagsordener-og-referater/%C3%98konomiudvalget"
+WASABI_BUCKET = "raw-files-copenhagen"
+
+if IS_RENDER:
+    OUTPUT_DIR = "/tmp"
+    print(f"--- RUNNING ON RENDER (CLOUD MODE) ---")
+else:
+    OUTPUT_DIR = os.path.abspath("referater_kobenhavn")
+    print(f"--- RUNNING LOCALLY ---")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -55,16 +66,18 @@ def get_all_meeting_urls():
                         # Extract Date
                         date_col = row.find("td", class_="views-field-agenda-meeting-date")
                         date_text = date_col.get_text(strip=True) if date_col else "00-00-0000"
+                        
+                        file_date = "0000-00-00"
+                        date_obj = None
 
                         try:
                             d_match = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", date_text)
                             if d_match:
                                 d, m, y = d_match.groups()
                                 file_date = f"{y}-{m}-{d}"
-                            else:
-                                file_date = "0000-00-00"
+                                date_obj = datetime.date(int(y), int(m), int(d))
                         except:
-                            file_date = "0000-00-00"
+                            pass
 
                         full_url = urljoin(BASE_DOMAIN, href)
 
@@ -73,7 +86,8 @@ def get_all_meeting_urls():
                             all_meetings.append({
                                 "url": full_url,
                                 "filename": f"{file_date}_kk_oekonomiudvalget.pdf",
-                                "date": file_date
+                                "date": file_date,
+                                "date_obj": date_obj
                             })
                             found_on_page += 1
 
@@ -163,6 +177,23 @@ def scrape_item_content(item_url):
 
 
 def create_meeting_pdf(meeting, agenda_items):
+    filename = meeting['filename']
+    output_path = os.path.join(OUTPUT_DIR, filename)
+    
+    # --- CHECK IF EXISTS (Cloud or Local) ---
+    if IS_RENDER:
+        s3 = scraper_utils.get_s3_client()
+        if s3:
+            try:
+                s3.head_object(Bucket=WASABI_BUCKET, Key=filename)
+                print(f"Skipping {filename} (Already in Wasabi)")
+                return True # Count as processed
+            except:
+                pass
+    elif os.path.exists(output_path):
+        # print(f"Skipping {filename} (Exists locally)")
+        return True
+
     full_html = f"""
     <html>
     <head>
@@ -185,7 +216,7 @@ def create_meeting_pdf(meeting, agenda_items):
         </div>
     """
 
-    print(f"    > Scraping {len(agenda_items)} items...")
+    print(f"    > Scraping {len(agenda_items)} items for {filename}...")
 
     for item in agenda_items:
         html_content = scrape_item_content(item['url'])
@@ -198,35 +229,54 @@ def create_meeting_pdf(meeting, agenda_items):
 
     full_html += "</body></html>"
 
-    output_path = os.path.join(OUTPUT_DIR, meeting['filename'])
-    HTML(string=full_html).write_pdf(output_path)
-    print(f"    > Saved: {meeting['filename']}")
+    try:
+        HTML(string=full_html).write_pdf(output_path)
+        
+        # --- UPLOAD IF ON RENDER ---
+        if IS_RENDER:
+            scraper_utils.upload_to_wasabi(output_path, WASABI_BUCKET, filename)
+            if os.path.exists(output_path):
+                os.remove(output_path)
+        else:
+            print(f"    > Saved: {filename}")
+            
+        return True
+    except Exception as e:
+        print(f"    ! Error generating PDF: {e}")
+        return False
 
 
 def run_scraper():
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # 1. Get ALL meetings
     meetings = get_all_meeting_urls()
-
+    
     # 2. Process
-    for i, meeting in enumerate(meetings):
-        filepath = os.path.join(OUTPUT_DIR, meeting['filename'])
+    download_limit = scraper_utils.get_download_limit()
+    processed_count = 0
 
-        if os.path.exists(filepath):
-            # print(f"[{i+1}/{len(meetings)}] Skipping {meeting['filename']} (Exists)")
-            continue
+    for i, meeting in enumerate(meetings):
+        if download_limit and processed_count >= download_limit:
+            print(f"Reached download limit ({download_limit}). Stopping.")
+            break
+            
+        date_obj = meeting.get('date_obj')
+        # --- DATE FILTERING ---
+        if date_obj and not scraper_utils.should_scrape(date_obj):
+             # print(f"Skipping {meeting['filename']} (Filtered by Date)")
+             continue
 
         print(f"[{i + 1}/{len(meetings)}] Processing {meeting['date']}...")
 
         agenda_items = get_agenda_items(meeting['url'])
         if agenda_items:
-            create_meeting_pdf(meeting, agenda_items)
+            if create_meeting_pdf(meeting, agenda_items):
+                processed_count += 1
         else:
             print("    > No agenda items found.")
 
-    print("--- Job Complete ---")
+    print("--- Copenhagen Scrape Complete ---")
 
 
 if __name__ == "__main__":

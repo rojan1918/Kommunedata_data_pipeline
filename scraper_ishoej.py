@@ -4,6 +4,8 @@ import time
 import base64
 import json
 import platform
+import datetime
+import scraper_utils
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
@@ -19,20 +21,10 @@ except ImportError:
     print("Error: Selenium library not found.")
     exit()
 
-try:
-    import boto3
-    from botocore.exceptions import NoCredentialsError
-except ImportError:
-    print("Warning: boto3 not found.")
-
 # --- CONFIGURATION ---
 IS_RENDER = os.environ.get('RENDER') == 'true'
 START_URL = 'https://ishoj.dk/borger/demokrati/dagsordener-og-referater/'
-
-WASABI_ACCESS_KEY = os.environ.get("WASABI_ACCESS_KEY")
-WASABI_SECRET_KEY = os.environ.get("WASABI_SECRET_KEY")
 WASABI_BUCKET = "raw-files-ishoej" 
-WASABI_ENDPOINT = os.environ.get("WASABI_ENDPOINT", "https://s3.eu-central-1.wasabisys.com")
 
 if IS_RENDER:
     DOWNLOAD_DIR = "/tmp"
@@ -40,36 +32,6 @@ if IS_RENDER:
 else:
     DOWNLOAD_DIR = os.path.abspath('referater_ishoj_local')
     print(f"--- RUNNING LOCALLY ---")
-
-
-# --- WASABI HELPER ---
-def upload_to_wasabi(local_file_path, remote_filename):
-    if not WASABI_ACCESS_KEY or not WASABI_SECRET_KEY:
-        print("   > Error: Wasabi credentials missing.")
-        return False
-
-    s3 = boto3.client(
-        's3',
-        endpoint_url=WASABI_ENDPOINT,
-        aws_access_key_id=WASABI_ACCESS_KEY,
-        aws_secret_access_key=WASABI_SECRET_KEY
-    )
-    try:
-        try:
-            s3.head_object(Bucket=WASABI_BUCKET, Key=remote_filename)
-            print(f"   > Skipping: {remote_filename} already exists.")
-            return "EXISTS"
-        except:
-            pass
-
-        print(f"   > Uploading to Wasabi...")
-        with open(local_file_path, "rb") as f:
-            s3.put_object(Bucket=WASABI_BUCKET, Key=remote_filename, Body=f)
-        print(f"   > Upload Success!")
-        return True
-    except Exception as e:
-        print(f"   > Wasabi Upload Error: {e}")
-        return False
 
 
 # --- SETUP SELENIUM (FIXED) ---
@@ -175,24 +137,34 @@ def process_meeting(driver, url):
     try:
         # Extract date for filename (e.g., 18-08-2025)
         date_match = re.search(r'(\d{2}-\d{2}-\d{4})', url)
+        date_obj = None
         if date_match:
-            d, m, y = date_match.group(1).split('-')
-            filename = f"{y}-{m}-{d}_ishoj_oekonomiudvalget.pdf"
+            d_str, m_str, y_str = date_match.group(1).split('-')
+            filename = f"{y_str}-{m_str}-{d_str}_ishoj_oekonomiudvalget.pdf"
+            try:
+                date_obj = datetime.date(int(y_str), int(m_str), int(d_str))
+            except:
+                pass
         else:
             filename = f"ishoj_{url.split('/')[-1][:20]}.pdf"
+
+        # --- DATE FILTERING ---
+        if date_obj and not scraper_utils.should_scrape(date_obj):
+             # print(f"Skipping {filename} (Filtered by Date)")
+             return
 
         local_path = os.path.join(DOWNLOAD_DIR, filename)
 
         # --- CHECK IF EXISTS (Cloud or Local) ---
         if IS_RENDER:
-            s3 = boto3.client('s3', endpoint_url=WASABI_ENDPOINT, aws_access_key_id=WASABI_ACCESS_KEY,
-                              aws_secret_access_key=WASABI_SECRET_KEY)
-            try:
-                s3.head_object(Bucket=WASABI_BUCKET, Key=filename)
-                print(f"Skipping {filename} (Already in Wasabi)")
-                return
-            except:
-                pass
+            s3 = scraper_utils.get_s3_client()
+            if s3:
+                try:
+                    s3.head_object(Bucket=WASABI_BUCKET, Key=filename)
+                    print(f"Skipping {filename} (Already in Wasabi)")
+                    return
+                except:
+                    pass
         elif os.path.exists(local_path):
             print(f"Skipping {filename} (Exists locally)")
             return
@@ -240,7 +212,7 @@ def process_meeting(driver, url):
             
             # --- UPLOAD IF ON RENDER ---
             if IS_RENDER:
-                upload_to_wasabi(local_path, filename)
+                scraper_utils.upload_to_wasabi(local_path, WASABI_BUCKET, filename)
                 if os.path.exists(local_path):
                     os.remove(local_path)
             else:

@@ -4,6 +4,8 @@ import re
 import base64
 import json
 import platform
+import datetime
+import scraper_utils
 
 # --- LIBRARIES ---
 try:
@@ -17,21 +19,11 @@ except ImportError:
     print("Error: Selenium library not found.")
     exit()
 
-try:
-    import boto3
-    from botocore.exceptions import NoCredentialsError
-except ImportError:
-    print("Warning: boto3 not found.")
-
 # --- CONFIGURATION ---
 IS_RENDER = os.environ.get('RENDER') == 'true'
 BASE_URL = "https://www.rk.dk"
 START_URL = "https://www.rk.dk/politik/politiske-udvalg/oekonomiudvalget"
-
-WASABI_ACCESS_KEY = os.environ.get("WASABI_ACCESS_KEY")
-WASABI_SECRET_KEY = os.environ.get("WASABI_SECRET_KEY")
 WASABI_BUCKET = "raw-files-roedovre"
-WASABI_ENDPOINT = os.environ.get("WASABI_ENDPOINT", "https://s3.eu-central-1.wasabisys.com")
 
 if IS_RENDER:
     DOWNLOAD_DIR = "/tmp"
@@ -39,37 +31,6 @@ if IS_RENDER:
 else:
     DOWNLOAD_DIR = os.path.abspath('raw_files_roedovre')
     print(f"--- RUNNING LOCALLY ---")
-
-
-# --- WASABI HELPER ---
-def upload_to_wasabi(local_file_path, remote_filename):
-    if not WASABI_ACCESS_KEY or not WASABI_SECRET_KEY:
-        print("   > Error: Wasabi credentials missing.")
-        return False
-
-    s3 = boto3.client(
-        's3',
-        endpoint_url=WASABI_ENDPOINT,
-        aws_access_key_id=WASABI_ACCESS_KEY,
-        aws_secret_access_key=WASABI_SECRET_KEY
-    )
-    try:
-        try:
-            s3.head_object(Bucket=WASABI_BUCKET, Key=remote_filename)
-            print(f"   > Skipping: {remote_filename} already exists.")
-            return "EXISTS"
-        except:
-            pass
-
-        print(f"   > Uploading to Wasabi...")
-        with open(local_file_path, "rb") as f:
-            s3.put_object(Bucket=WASABI_BUCKET, Key=remote_filename, Body=f)
-        print(f"   > Upload Success!")
-        return True
-    except Exception as e:
-        print(f"   > Wasabi Upload Error: {e}")
-        return False
-
 
 # --- SETUP SELENIUM (FIXED) ---
 def get_driver():
@@ -167,8 +128,13 @@ def get_meeting_links(driver):
         if text and href:
             match = re.search(r"(\d{2})-(\d{2})-(\d{4})", text.strip())
             if match:
-                d, m, y = match.groups()
-                meetings.append((href, f"{y}-{m}-{d}"))
+                d_str, m_str, y_str = match.groups()
+                # Create date object for filtering
+                try:
+                    date_obj = datetime.date(int(y_str), int(m_str), int(d_str))
+                    meetings.append((href, f"{y_str}-{m_str}-{d_str}", date_obj))
+                except:
+                    pass
     return meetings
 
 
@@ -177,14 +143,14 @@ def process_meeting(driver, meeting_url, date_str):
     local_path = os.path.join(DOWNLOAD_DIR, filename)
 
     if IS_RENDER:
-        s3 = boto3.client('s3', endpoint_url=WASABI_ENDPOINT, aws_access_key_id=WASABI_ACCESS_KEY,
-                          aws_secret_access_key=WASABI_SECRET_KEY)
-        try:
-            s3.head_object(Bucket=WASABI_BUCKET, Key=filename)
-            print(f"Skipping {filename} (Already in Wasabi)")
-            return
-        except:
-            pass
+        s3 = scraper_utils.get_s3_client()
+        if s3:
+            try:
+                s3.head_object(Bucket=WASABI_BUCKET, Key=filename)
+                print(f"Skipping {filename} (Already in Wasabi)")
+                return
+            except:
+                pass
 
     elif os.path.exists(local_path):
         print(f"Skipping {filename} (Exists locally)")
@@ -198,7 +164,7 @@ def process_meeting(driver, meeting_url, date_str):
 
         if print_page_to_pdf(driver, local_path):
             if IS_RENDER:
-                upload_to_wasabi(local_path, filename)
+                scraper_utils.upload_to_wasabi(local_path, WASABI_BUCKET, filename)
                 if os.path.exists(local_path):
                     os.remove(local_path)
             else:
@@ -217,8 +183,15 @@ def run_roedovre_scraper():
     try:
         meetings = get_meeting_links(driver)
         print(f"Found {len(meetings)} meetings.")
-        for i, (url, date) in enumerate(meetings):
-            process_meeting(driver, url, date)
+        
+        for i, (url, date_str, date_obj) in enumerate(meetings):
+            # Check Date Filter
+            if not scraper_utils.should_scrape(date_obj):
+                # print(f"Skipping {date_str} (Filtered by Date)")
+                continue
+                
+            process_meeting(driver, url, date_str)
+            
     finally:
         driver.quit()
         print("\n--- Complete! ---")

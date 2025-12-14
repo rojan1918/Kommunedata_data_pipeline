@@ -1,9 +1,14 @@
 import os
 import time
 import re
+import json
+import datetime
 from glob import glob
 
-# Import Selenium
+# --- UTILS ---
+import scraper_utils
+
+# --- LIBRARIES ---
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.service import Service
@@ -17,17 +22,36 @@ except ImportError:
     exit()
 
 # --- CONFIGURATION ---
-DOWNLOAD_DIR = os.path.abspath('raw_files_furesoe')
+IS_RENDER = os.environ.get('RENDER') == 'true'
 START_URL = "https://furesoe.meetingsplus.dk/committees/okonomiudvalget"
 BASE_URL = "https://furesoe.meetingsplus.dk"
+WASABI_BUCKET = "raw-files-furesoe"
+
+if IS_RENDER:
+    DOWNLOAD_DIR = "/tmp"
+    print(f"--- RUNNING ON RENDER (CLOUD MODE) ---")
+else:
+    DOWNLOAD_DIR = os.path.abspath('raw_files_furesoe')
+    print(f"--- RUNNING LOCALLY ---")
 
 
 # --- SETUP SELENIUM ---
 def get_driver():
     chrome_options = Options()
-    # chrome_options.add_argument("--headless") # Keep visible for safety
-    chrome_options.add_argument("--disable-gpu")
+    
+    # 1. BASIC STABILITY OPTIONS
     chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--remote-debugging-port=9222")
+    
+    # 2. RENDER SPECIFIC
+    if IS_RENDER:
+        chrome_options.add_argument("--headless=new")
+        chrome_options.binary_location = "/usr/bin/chromium"
+    else:
+        chrome_options.add_argument("--headless=new")
 
     # Force download to our folder
     prefs = {
@@ -38,13 +62,15 @@ def get_driver():
     }
     chrome_options.add_experimental_option("prefs", prefs)
 
-    driver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
-    if not os.path.exists(driver_path):
-        driver_path = 'chromedriver'
+    if IS_RENDER:
+        print(f"   Binary: /usr/bin/chromium")
 
-    service = Service(executable_path=driver_path)
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    return driver
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        return driver
+    except Exception as e:
+        print(f"Error starting Chrome: {e}")
+        return None
 
 
 # --- STEP 1: FIND MEETING LINKS AND DATES ---
@@ -62,11 +88,9 @@ def get_meeting_info(driver):
         return []
 
     # Find all rows in the recent content
-    # We look for the specific class you identified: 'accessible-table-cell'
-    # inside the recent content div
     links = driver.find_elements(By.CSS_SELECTOR, "#committeesRecentContent a.accessible-table-cell")
 
-    meetings = []  # List of tuples: (url, date_string)
+    meetings = []  # List of dicts: {url, date_str, date_obj}
     seen_urls = set()
 
     for link in links:
@@ -79,33 +103,63 @@ def get_meeting_info(driver):
 
         # Extract Date from text (e.g., "2025-11-04")
         date_match = re.search(r"(\d{4}-\d{2}-\d{2})", text)
-
+        date_str = None
+        
         if date_match:
             date_str = date_match.group(1)
-            meetings.append((href, date_str))
-            seen_urls.add(href)
         else:
             # Fallback: Try to get date from aria-label
             aria = link.get_attribute("aria-label")
             date_match_aria = re.search(r"(\d{4}-\d{2}-\d{2})", aria if aria else "")
             if date_match_aria:
                 date_str = date_match_aria.group(1)
-                meetings.append((href, date_str))
+        
+        if date_str:
+            try:
+                y, m, d = map(int, date_str.split('-'))
+                date_obj = datetime.date(y, m, d)
+                
+                meetings.append({
+                    "url": href, 
+                    "date_str": date_str,
+                    "date_obj": date_obj
+                })
                 seen_urls.add(href)
+            except:
+                pass
 
     print(f"  > Found {len(meetings)} unique meetings with dates.")
     return meetings
 
 
 # --- STEP 2: DOWNLOAD PDF ---
-def download_meeting_pdf(driver, meeting_url, date_str):
+def download_meeting_pdf(driver, meeting):
+    date_str = meeting['date_str']
+    meeting_url = meeting['url']
+    date_obj = meeting['date_obj']
+
+    # --- DATE FILTERING ---
+    if date_obj and not scraper_utils.should_scrape(date_obj):
+         # print(f"Skipping {date_str} (Filtered by Date)")
+         return False
+
     # 1. Generate Filename
     filename = f"{date_str}_furesoe_oekonomiudvalget.pdf"
-    final_path = os.path.join(DOWNLOAD_DIR, filename)
+    local_path = os.path.join(DOWNLOAD_DIR, filename)
 
-    if os.path.exists(final_path):
+    # --- CHECK IF EXISTS (Cloud or Local) ---
+    if IS_RENDER:
+        s3 = scraper_utils.get_s3_client()
+        if s3:
+            try:
+                s3.head_object(Bucket=WASABI_BUCKET, Key=filename)
+                print(f"Skipping {filename} (Already in Wasabi)")
+                return True # Count as processed
+            except:
+                pass
+    elif os.path.exists(local_path):
         # print(f"Skipping (Exists): {filename}")
-        return
+        return True
 
     # 2. Visit Meeting Page
     driver.get(meeting_url)
@@ -130,7 +184,7 @@ def download_meeting_pdf(driver, meeting_url, date_str):
         driver.get(pdf_url)
 
         # 6. Wait for file
-        timeout = time.time() + 30
+        timeout = time.time() + 60
         while time.time() < timeout:
             files_now = set(glob(os.path.join(DOWNLOAD_DIR, "*.pdf")))
             new_files = files_now - files_before
@@ -141,35 +195,62 @@ def download_meeting_pdf(driver, meeting_url, date_str):
                 if not new_file.endswith(".crdownload"):
                     # Rename
                     time.sleep(1)  # Release lock
-                    os.rename(new_file, final_path)
-                    print("  > Success!")
-                    return
+                    # If target exists locally (unlikely due to check above), remove it
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                        
+                    os.rename(new_file, local_path)
+                    
+                    # --- UPLOAD IF ON RENDER ---
+                    if IS_RENDER:
+                        scraper_utils.upload_to_wasabi(local_path, WASABI_BUCKET, filename)
+                        if os.path.exists(local_path):
+                            os.remove(local_path)
+                    else:
+                        print("  > Success!")
+                        
+                    return True
             time.sleep(0.5)
 
         print("  > Error: Timeout waiting for file.")
+        return False
 
     except TimeoutException:
         print(f"  > Skipped: No 'Vis referat' (openProtocol) button found on {meeting_url}")
+        return False
     except Exception as e:
         print(f"  > Error: {e}")
+        return False
 
 
 # --- MAIN ---
 def run_furesoe_scraper():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     driver = get_driver()
+    if not driver: return
 
-    # 1. Get list of meetings + dates
-    meetings_data = get_meeting_info(driver)
+    try:
+        # 1. Get list of meetings + dates
+        meetings_data = get_meeting_info(driver)
 
-    # 2. Process downloads
-    print(f"\n--- Step 2: Downloading {len(meetings_data)} PDFs ---")
-    for i, (url, date) in enumerate(meetings_data):
-        print(f"[{i + 1}/{len(meetings_data)}]", end=" ")
-        download_meeting_pdf(driver, url, date)
-
-    driver.quit()
-    print("\n--- Furesoe Scrape Complete! ---")
+        # 2. Process downloads
+        print(f"\n--- Step 2: Downloading {len(meetings_data)} PDFs ---")
+        
+        download_limit = scraper_utils.get_download_limit()
+        processed_count = 0
+        
+        for i, meeting in enumerate(meetings_data):
+            if download_limit and processed_count >= download_limit:
+                print(f"Reached download limit ({download_limit}). Stopping.")
+                break
+                
+            print(f"[{i + 1}/{len(meetings_data)}]", end=" ")
+            if download_meeting_pdf(driver, meeting):
+                processed_count += 1
+                
+    finally:
+        driver.quit()
+        print("\n--- Furesoe Scrape Complete! ---")
 
 
 if __name__ == "__main__":
