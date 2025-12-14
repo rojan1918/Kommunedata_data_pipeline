@@ -2,9 +2,12 @@ import os
 import time
 import re
 import requests
+import json
+import datetime
+import scraper_utils
 from urllib.parse import urljoin
 
-# Import Selenium
+# --- LIBRARIES ---
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.service import Service
@@ -18,27 +21,47 @@ except ImportError:
     exit()
 
 # --- CONFIGURATION ---
-DOWNLOAD_DIR = os.path.abspath('raw_files_syddjurs')
+IS_RENDER = os.environ.get('RENDER') == 'true'
 BASE_URL = "https://aabendagsorden.syddjurs.dk"
 START_URL = "https://aabendagsorden.syddjurs.dk/"
-# Date to search from (DD/MM/YYYY)
 START_DATE = "01/01/2023"
+WASABI_BUCKET = "raw-files-syddjurs"
+
+if IS_RENDER:
+    DOWNLOAD_DIR = "/tmp"
+    print(f"--- RUNNING ON RENDER (CLOUD MODE) ---")
+else:
+    DOWNLOAD_DIR = os.path.abspath('raw_files_syddjurs')
+    print(f"--- RUNNING LOCALLY ---")
 
 
 # --- SETUP SELENIUM ---
 def get_driver():
     chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--disable-gpu")
+    
+    # 1. BASIC STABILITY OPTIONS
     chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--remote-debugging-port=9222")
+    
+    # 2. RENDER SPECIFIC
+    if IS_RENDER:
+        chrome_options.add_argument("--headless=new")
+        chrome_options.binary_location = "/usr/bin/chromium"
+    else:
+        chrome_options.add_argument("--headless=new")
 
-    driver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
-    if not os.path.exists(driver_path):
-        driver_path = 'chromedriver'
+    if IS_RENDER:
+        print(f"   Binary: /usr/bin/chromium")
 
-    service = Service(executable_path=driver_path)
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    return driver
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        return driver
+    except Exception as e:
+        print(f"Error starting Chrome: {e}")
+        return None
 
 
 # --- STEP 1: PERFORM SEARCH ---
@@ -105,12 +128,17 @@ def get_meeting_links(driver):
                     clean_date = date_match.group(1)
                     d, m, y = clean_date.split('-')
                     iso_date = f"{y}-{m}-{d}"
+                    date_obj = datetime.date(int(y), int(m), int(d))
 
                     link_el = row.find_element(By.CSS_SELECTOR, "a.row-link")
                     href = link_el.get_attribute('href')
 
                     if href and href not in seen_urls:
-                        all_meetings.append((href, iso_date))
+                        all_meetings.append({
+                            "url": href,
+                            "date_str": iso_date,
+                            "date_obj": date_obj
+                        })
                         seen_urls.add(href)
 
                 except StaleElementReferenceException:
@@ -142,12 +170,32 @@ def get_meeting_links(driver):
 
 
 # --- STEP 3: DOWNLOAD PDF (SELENIUM ENABLED) ---
-def download_pdf(driver, meeting_url, date_str):
-    filename = f"{date_str}_syddjurs_oekonomiudvalget.pdf"
-    final_path = os.path.join(DOWNLOAD_DIR, filename)
+def download_pdf(driver, meeting):
+    date_str = meeting['date_str']
+    meeting_url = meeting['url']
+    date_obj = meeting['date_obj']
 
-    if os.path.exists(final_path):
-        return
+    # --- DATE FILTERING ---
+    if date_obj and not scraper_utils.should_scrape(date_obj):
+         # print(f"Skipping {date_str} (Filtered by Date)")
+         return False
+
+    filename = f"{date_str}_syddjurs_oekonomiudvalget.pdf"
+    local_path = os.path.join(DOWNLOAD_DIR, filename)
+
+    # --- CHECK IF EXISTS (Cloud or Local) ---
+    if IS_RENDER:
+        s3 = scraper_utils.get_s3_client()
+        if s3:
+            try:
+                s3.head_object(Bucket=WASABI_BUCKET, Key=filename)
+                print(f"Skipping {filename} (Already in Wasabi)")
+                return True # Count as processed
+            except:
+                pass
+    elif os.path.exists(local_path):
+        # print(f"Skipping (Exists): {filename}")
+        return True
 
     print(f"Processing: {filename} ...")
 
@@ -169,17 +217,29 @@ def download_pdf(driver, meeting_url, date_str):
             resp = requests.get(pdf_url, stream=True)
             resp.raise_for_status()
 
-            with open(final_path, 'wb') as f:
+            with open(local_path, 'wb') as f:
                 for chunk in resp.iter_content(chunk_size=8192):
                     f.write(chunk)
-            print("   > Success!")
+            
+            # --- UPLOAD IF ON RENDER ---
+            if IS_RENDER:
+                scraper_utils.upload_to_wasabi(local_path, WASABI_BUCKET, filename)
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+            else:
+                print("   > Saved locally.")
+                
+            return True
         else:
             print(f"   > Skipped: Button found but attributes missing.")
+            return False
 
     except TimeoutException:
         print(f"   > Skipped: Download button not loaded/found on page.")
+        return False
     except Exception as e:
         print(f"   > Error: {e}")
+        return False
 
 
 # --- MAIN ---
@@ -187,24 +247,35 @@ def run_syddjurs_scraper():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
     driver = get_driver()
+    if not driver: return
 
-    if not perform_search(driver):
+    try:
+        if not perform_search(driver):
+            return
+
+        meetings = get_meeting_links(driver)
+
+        if not meetings:
+            print("No meetings found.")
+            return
+
+        print(f"\n--- Step 3: Downloading {len(meetings)} PDFs ---")
+        
+        download_limit = scraper_utils.get_download_limit()
+        processed_count = 0
+        
+        for i, meeting in enumerate(meetings):
+            if download_limit and processed_count >= download_limit:
+                print(f"Reached download limit ({download_limit}). Stopping.")
+                break
+                
+            print(f"[{i + 1}/{len(meetings)}]", end=" ")
+            if download_pdf(driver, meeting):
+                processed_count += 1
+                
+    finally:
         driver.quit()
-        return
-
-    meetings = get_meeting_links(driver)
-
-    if not meetings:
-        print("No meetings found.")
-        driver.quit()
-        return
-
-    print(f"\n--- Step 3: Downloading {len(meetings)} PDFs ---")
-    for i, (url, date) in enumerate(meetings):
-        download_pdf(driver, url, date)
-
-    driver.quit()
-    print("\n--- Syddjurs Scrape Complete! ---")
+        print("\n--- Syddjurs Scrape Complete! ---")
 
 
 if __name__ == "__main__":

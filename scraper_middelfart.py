@@ -2,29 +2,81 @@ import os
 import re
 import time
 import base64
+import json
 import datetime
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
-import undetected_chromedriver as uc
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+
+# --- UTILS ---
+import scraper_utils
+
+# --- LIBRARIES ---
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+except ImportError:
+    print("Error: Selenium library not found. Run: pip install selenium")
+    exit()
 
 # --- CONFIGURATION ---
-DOWNLOAD_DIR = os.path.abspath('referater_middelfart')
+IS_RENDER = os.environ.get('RENDER') == 'true'
 BASE_URL = "https://middelfart.bcdagsorden.dk"
+WASABI_BUCKET = "raw-files-middelfart"
+
+if IS_RENDER:
+    DOWNLOAD_DIR = "/tmp"
+    print(f"--- RUNNING ON RENDER (CLOUD MODE) ---")
+else:
+    DOWNLOAD_DIR = os.path.abspath('referater_middelfart')
+    print(f"--- RUNNING LOCALLY ---")
 
 
 def get_driver():
     print("Initializing Headless Browser...")
-    options = uc.ChromeOptions()
-    options.add_argument("--disable-gpu")
+    chrome_options = Options()
+    
+    # 1. BASIC STABILITY OPTIONS
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--remote-debugging-port=9222")
+    
+    # 2. USER AGENT (Cloudflare Bypassing)
+    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
+    # 3. RENDER SPECIFIC
+    if IS_RENDER:
+        chrome_options.add_argument("--headless=new")
+        chrome_options.binary_location = "/usr/bin/chromium"
+    else:
+        chrome_options.add_argument("--headless=new")
 
-    # CRITICAL: Page.printToPDF requires headless mode to work reliably
-    options.add_argument("--headless=new")
+    # 4. PRINTING PREFS
+    settings = {
+        "recentDestinations": [{"id": "Save as PDF", "origin": "local", "account": ""}],
+        "selectedDestinationId": "Save as PDF",
+        "version": 2
+    }
+    prefs = {
+        'printing.print_preview_sticky_settings.appState': json.dumps(settings),
+        'savefile.default_directory': DOWNLOAD_DIR
+    }
+    chrome_options.add_experimental_option('prefs', prefs)
 
-    driver = uc.Chrome(options=options, version_main=141)
-    return driver
+    if IS_RENDER:
+        print(f"   Binary: /usr/bin/chromium")
+
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        return driver
+    except Exception as e:
+        print(f"Error starting Chrome: {e}")
+        return None
 
 
 def get_meeting_links(driver):
@@ -73,7 +125,8 @@ def get_meeting_links(driver):
         # Format in HTML: "25. november 2025 - 15:30"
         date_div = teaser.find("div", class_="meeting-teaser-time")
         date_text = date_div.get_text(strip=True) if date_div else "0000"
-
+        
+        date_obj = None
         try:
             # Regex for "25. november 2025"
             date_match = re.search(r"(\d+)\.\s+([a-z]+)\s+(\d{4})", date_text.lower())
@@ -86,6 +139,7 @@ def get_meeting_links(driver):
                 }
                 m = months.get(month_name, '01')
                 filename = f"{year}-{m}-{day.zfill(2)}_middelfart_oekonomiudvalget.pdf"
+                date_obj = datetime.date(int(year), int(m), int(day))
             else:
                 filename = f"middelfart_unknown_{len(meetings)}.pdf"
         except:
@@ -96,18 +150,38 @@ def get_meeting_links(driver):
             meetings.append({
                 "url": full_url,
                 "filename": filename,
-                "date": date_text
+                "date_obj": date_obj
             })
 
     print(f"  > Found {len(meetings)} 'Referat' meetings.")
     return meetings
 
 
-def save_page_as_pdf(driver, url, filename):
-    final_path = os.path.join(DOWNLOAD_DIR, filename)
-    if os.path.exists(final_path):
-        # print(f"Skipping {filename} (Exists)")
-        return
+def save_page_as_pdf(driver, meeting):
+    filename = meeting['filename']
+    url = meeting['url']
+    date_obj = meeting['date_obj']
+
+    # --- DATE FILTERING ---
+    if date_obj and not scraper_utils.should_scrape(date_obj):
+         # print(f"Skipping {filename} (Filtered by Date)")
+         return False
+
+    local_path = os.path.join(DOWNLOAD_DIR, filename)
+
+    # --- CHECK IF EXISTS (Cloud or Local) ---
+    if IS_RENDER:
+        s3 = scraper_utils.get_s3_client()
+        if s3:
+            try:
+                s3.head_object(Bucket=WASABI_BUCKET, Key=filename)
+                print(f"Skipping {filename} (Already in Wasabi)")
+                return True # Count as processed
+            except:
+                pass
+    elif os.path.exists(local_path):
+        # print(f"Skipping {filename} (Exists locally)")
+        return True
 
     print(f"Processing: {filename}")
 
@@ -140,7 +214,6 @@ def save_page_as_pdf(driver, url, filename):
             });
 
             // 4. Force Content Width
-            // This ensures the text fills the PDF page nicely
             var main = document.querySelector('.region-content');
             if(main) {
                 main.style.width = '100%';
@@ -163,26 +236,44 @@ def save_page_as_pdf(driver, url, filename):
             "marginRight": 0.4
         })
 
-        with open(final_path, 'wb') as f:
+        with open(local_path, 'wb') as f:
             f.write(base64.b64decode(result['data']))
 
-        print("  > Saved.")
+        # --- UPLOAD IF ON RENDER ---
+        if IS_RENDER:
+            scraper_utils.upload_to_wasabi(local_path, WASABI_BUCKET, filename)
+            if os.path.exists(local_path):
+                os.remove(local_path)
+        else:
+            print("  > Saved.")
+            
+        return True
 
     except Exception as e:
         print(f"Error generating PDF: {e}")
+        return False
 
 
 def run_scraper():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     driver = get_driver()
+    if not driver: return
 
     try:
         meetings = get_meeting_links(driver)
 
+        download_limit = scraper_utils.get_download_limit()
+        processed_count = 0
+        
         for i, meeting in enumerate(meetings):
+            if download_limit and processed_count >= download_limit:
+                print(f"Reached download limit ({download_limit}). Stopping.")
+                break
+                
             print(f"[{i + 1}/{len(meetings)}]", end=" ")
-            save_page_as_pdf(driver, meeting['url'], meeting['filename'])
-
+            if save_page_as_pdf(driver, meeting):
+                processed_count += 1
+                
     finally:
         driver.quit()
         print("\n--- Done! ---")

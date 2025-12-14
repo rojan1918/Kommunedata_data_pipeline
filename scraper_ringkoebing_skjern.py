@@ -1,6 +1,7 @@
 import os
 import re
 import requests
+import datetime
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from pypdf import PdfWriter
@@ -8,10 +9,21 @@ from io import BytesIO
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 
+# --- UTILS ---
+import scraper_utils
+
 # --- CONFIGURATION ---
+IS_RENDER = os.environ.get('RENDER') == 'true'
 BASE_URL = "https://www.rksk.dk"
 START_URL = "https://www.rksk.dk/om-kommunen/politiske-udvalg-2022-2025/oekonomiudvalget/dagsordener-referater"
-OUTPUT_DIR = "referater_rksk"
+WASABI_BUCKET = "raw-files-ringkoebing-skjern"
+
+if IS_RENDER:
+    OUTPUT_DIR = "/tmp"
+    print(f"--- RUNNING ON RENDER (CLOUD MODE) ---")
+else:
+    OUTPUT_DIR = os.path.abspath("referater_rksk")
+    print(f"--- RUNNING LOCALLY ---")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
@@ -88,24 +100,32 @@ def get_meeting_links():
                 full_url = urljoin(BASE_URL, relative_url)
 
                 date_text = cols[1].get_text(strip=True)
+                date_obj = None
 
                 # Parse date for filename
-                date_match = re.search(r"(\d+)\.\s+([a-z]+)\s+(\d{4})", date_text.lower())
-                if date_match:
-                    day, month_name, year = date_match.groups()
-                    months = {
-                        'januar': '01', 'februar': '02', 'marts': '03', 'april': '04',
-                        'maj': '05', 'juni': '06', 'juli': '07', 'august': '08',
-                        'september': '09', 'oktober': '10', 'november': '11', 'december': '12'
-                    }
-                    month_num = months.get(month_name, '01')
-                    filename = f"{year}-{month_num}-{day.zfill(2)}_rksk_oekonomiudvalget.pdf"
+                try:
+                    date_match = re.search(r"(\d+)\.\s+([a-z]+)\s+(\d{4})", date_text.lower())
+                    if date_match:
+                        day, month_name, year = date_match.groups()
+                        months = {
+                            'januar': '01', 'februar': '02', 'marts': '03', 'april': '04',
+                            'maj': '05', 'juni': '06', 'juli': '07', 'august': '08',
+                            'september': '09', 'oktober': '10', 'november': '11', 'december': '12'
+                        }
+                        month_num = months.get(month_name, '01')
+                        filename = f"{year}-{month_num}-{day.zfill(2)}_rksk_oekonomiudvalget.pdf"
+                        date_obj = datetime.date(int(year), int(month_num), int(day))
+                    else:
+                        filename = f"rksk_unknown_{len(meetings)}.pdf"
+                except:
+                    filename = f"rksk_unknown_{len(meetings)}.pdf"
 
-                    meetings.append({
-                        'url': full_url,
-                        'filename': filename,
-                        'date': date_text
-                    })
+                meetings.append({
+                    'url': full_url,
+                    'filename': filename,
+                    'date': date_text,
+                    'date_obj': date_obj
+                })
 
     print(f"  > Found {len(meetings)} 'Referat' meetings.")
     return meetings
@@ -194,26 +214,54 @@ def download_and_merge(pdf_items, participants, output_filename, date_text):
 
     # --- 3. SAVE FINAL FILE ---
     output_path = os.path.join(OUTPUT_DIR, output_filename)
+    
+    # --- CHECK IF EXISTS (Cloud or Local) ---
+    if IS_RENDER:
+        s3 = scraper_utils.get_s3_client()
+        if s3:
+            try:
+                s3.head_object(Bucket=WASABI_BUCKET, Key=output_filename)
+                print(f"Skipping {output_filename} (Already in Wasabi)")
+                return True
+            except:
+                pass
+    elif os.path.exists(output_path):
+        # print(f"Skipping {output_filename} (Exists locally)")
+        return True
+
     with open(output_path, "wb") as fout:
         merger.write(fout)
-    print(f"  > SUCCESS: Saved {output_filename}")
-
-    merger.close()
+    
+    # --- UPLOAD IF ON RENDER ---
+    if IS_RENDER:
+        scraper_utils.upload_to_wasabi(output_path, WASABI_BUCKET, output_filename)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+    else:
+        print(f"  > SUCCESS: Saved {output_filename}")
+        
+    return True
 
 
 def run_scraper():
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     print("--- Starting Ringkøbing-Skjern Scraper ---")
     meetings = get_meeting_links()
+    
+    download_limit = scraper_utils.get_download_limit()
+    processed_count = 0
 
     for i, meeting in enumerate(meetings):
-        filepath = os.path.join(OUTPUT_DIR, meeting['filename'])
-
-        if os.path.exists(filepath):
-            # print(f"[{i+1}/{len(meetings)}] Skipping {meeting['filename']} (Exists)")
-            continue
+        if download_limit and processed_count >= download_limit:
+            print(f"Reached download limit ({download_limit}). Stopping.")
+            break
+            
+        date_obj = meeting.get('date_obj')
+        # --- DATE FILTERING ---
+        if date_obj and not scraper_utils.should_scrape(date_obj):
+             # print(f"Skipping {meeting['filename']} (Filtered by Date)")
+             continue
 
         print(f"\n[{i + 1}/{len(meetings)}] Processing: {meeting['date']}")
 
@@ -221,7 +269,8 @@ def run_scraper():
         pdf_items, participants = get_meeting_data(meeting['url'])
 
         # Pass everything to the merger
-        download_and_merge(pdf_items, participants, meeting['filename'], meeting['date'])
+        if download_and_merge(pdf_items, participants, meeting['filename'], meeting['date']):
+            processed_count += 1
 
     print("--- Job Complete ---")
 

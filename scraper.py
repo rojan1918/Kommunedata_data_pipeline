@@ -3,8 +3,12 @@ import re
 import time
 import csv
 import pandas as pd
+import datetime
 from glob import glob
 from urllib.parse import urlparse
+
+# Import shared utils
+import scraper_utils
 
 # Import Selenium
 try:
@@ -32,7 +36,7 @@ MAX_DOWNLOADS = 1  # Set to None for "everything", or an integer (e.g. 10) for a
 BASE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 }
-
+IS_RENDER = os.environ.get('RENDER') == 'true'
 
 def get_driver(download_dir):
     """
@@ -40,9 +44,19 @@ def get_driver(download_dir):
     downloads go to the correct specific folder.
     """
     chrome_options = Options()
-    chrome_options.add_argument("--headless")  # Run in background
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
+    
+    # Render Specific
+    if IS_RENDER:
+        chrome_options.add_argument("--headless=new")
+        chrome_options.binary_location = "/usr/bin/chromium"
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--remote-debugging-port=9222")
+    else:
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--no-sandbox")
 
     # Configure download folder dynamically
     prefs = {
@@ -53,12 +67,18 @@ def get_driver(download_dir):
     }
     chrome_options.add_experimental_option("prefs", prefs)
 
-    driver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
-    if not os.path.exists(driver_path):
-        driver_path = 'chromedriver'  # Fallback
-
-    service = Service(executable_path=driver_path)
-    driver = webdriver.Chrome(service=service, options=chrome_options)
+    if IS_RENDER:
+         print(f"   Binary: /usr/bin/chromium")
+         # Selenium Manager finds driver automatically on Render if installed via apt
+         driver = webdriver.Chrome(options=chrome_options)
+    else:
+        driver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
+        if not os.path.exists(driver_path):
+            driver_path = 'chromedriver'  # Fallback
+        
+        service = Service(executable_path=driver_path)
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        
     return driver
 
 
@@ -69,7 +89,13 @@ def get_meeting_links(driver, start_url, base_url):
     """
     print(f"   > Finding Meeting Pages on {start_url}...")
     driver.get(start_url)
-
+    
+    # ... (rest of the logic remains same until we implement better filtering logic here if possible)
+    # Actually, we can't filter by date effectively here without visiting the link or parsing text if available.
+    # The current logic collects all links then processes them.
+    # We will filter in process_download to save bandwidth/time on PDF downloads, 
+    # but we still have to find the links.
+    
     try:
         # Wait for the first link to ensure page loaded
         WebDriverWait(driver, 10).until(
@@ -132,25 +158,48 @@ def process_download(driver, meeting_url, base_url, download_dir, muni_name):
 
         # Determine Date for filename
         date_match = re.search(r'd\.(\d{2}-\d{2}-\d{4})', meeting_url)
+        date_obj = None
         if date_match:
-            d, m, y = date_match.group(1).split('-')
-            filename = f"{y}-{m}-{d}_{muni_name}_oekonomiudvalget.pdf"
+            d_str, m_str, y_str = date_match.group(1).split('-')
+            filename = f"{y_str}-{m_str}-{d_str}_{muni_name}_oekonomiudvalget.pdf"
+            try:
+                date_obj = datetime.date(int(y_str), int(m_str), int(d_str))
+            except:
+                pass
         else:
             filename = f"{muni_name}_oekonomiudvalget_{uuid}.pdf"
 
-        final_path = os.path.join(download_dir, filename)
-        if os.path.exists(final_path):
-            # print(f"     Skipping (Exists): {filename}")
-            return
+        # --- DATE FILTERING ---
+        if date_obj and not scraper_utils.should_scrape(date_obj):
+             # print(f"     Skipping (Old/Filtered Date): {filename}")
+             return
+
+        # Determine Paths
+        local_path = os.path.join(download_dir, filename)
+        bucket_name = f"raw-files-{muni_name}".replace('_', '-') # S3 buckets usually dash, not underscore
+
+        # --- CHECK EXISTENCE (Cloud or Local) ---
+        if IS_RENDER:
+             # Check Wasabi first
+             s3 = scraper_utils.get_s3_client()
+             try:
+                 s3.head_object(Bucket=bucket_name, Key=filename)
+                 print(f"     Skipping {filename} (Already in Wasabi)")
+                 return
+             except:
+                 pass
+        elif os.path.exists(local_path):
+             # print(f"     Skipping (Exists): {filename}")
+             return
 
         # Construct Direct Download Link
-        # Note: We use the specific base_url for this municipality
         direct_download_url = f"{base_url.rstrip('/')}/pdf/GetDagsorden/{uuid}"
 
+        print(f"     Downloading: {filename} ...")
+        
         # Snapshot for detection
         files_before = set(glob(os.path.join(download_dir, "*.pdf")))
-
-        print(f"     Downloading: {filename} ...")
+        
         try:
             driver.get(direct_download_url)
         except Exception as e:
@@ -172,14 +221,25 @@ def process_download(driver, meeting_url, base_url, download_dir, muni_name):
                     break
             time.sleep(0.5)
 
-        # Rename
+        # Rename & Upload
         if downloaded_file:
             try:
                 time.sleep(1)  # Release handle
-                os.rename(downloaded_file, final_path)
-                print(f"     > Success!")
+                # Move to final name
+                if os.path.exists(local_path):
+                    os.remove(local_path) # Overwrite if exists (locally)
+                os.rename(downloaded_file, local_path)
+                
+                # --- UPLOAD IF ON RENDER ---
+                if IS_RENDER:
+                    scraper_utils.upload_to_wasabi(local_path, bucket_name, filename)
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                else:
+                    print(f"     > Success!")
+                    
             except Exception as e:
-                print(f"     > Error renaming: {e}")
+                print(f"     > Error renaming/uploading: {e}")
         else:
             print("     > Timeout waiting for file.")
 

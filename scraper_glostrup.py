@@ -2,12 +2,13 @@ import os
 import time
 import re
 import requests
-import subprocess
+import json
+import datetime
 import platform
-from glob import glob
+import scraper_utils
 from urllib.parse import urljoin
 
-# Import Selenium
+# --- LIBRARIES ---
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.service import Service
@@ -20,109 +21,48 @@ except ImportError:
     print("Error: Selenium library not found. Run: pip install selenium")
     exit()
 
-# Import BeautifulSoup
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    print("Error: BeautifulSoup library not found. Run: pip install beautifulsoup4")
-    exit()
-
 # --- CONFIGURATION ---
-DOWNLOAD_DIR = os.path.abspath('raw_files_glostrup')
+IS_RENDER = os.environ.get('RENDER') == 'true'
 BASE_URL = "https://dagsorden.glostrup.dk"
 START_URL = "https://dagsorden.glostrup.dk/"
 START_DATE = "01/01/2023"
+WASABI_BUCKET = "raw-files-glostrup"
+
+if IS_RENDER:
+    DOWNLOAD_DIR = "/tmp"
+    print(f"--- RUNNING ON RENDER (CLOUD MODE) ---")
+else:
+    DOWNLOAD_DIR = os.path.abspath('raw_files_glostrup')
+    print(f"--- RUNNING LOCALLY ---")
 
 
 # --- SETUP SELENIUM ---
 def get_driver():
     chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--disable-gpu")
+    
+    # 1. BASIC STABILITY OPTIONS
     chrome_options.add_argument("--no-sandbox")
-    # chrome_options.add_argument("--disable-dev-shm-usage") # Linux optimization
-
-    # Smart Driver Path Selection
-    current_dir = os.getcwd()
-    if platform.system() == "Windows":
-        driver_path = os.path.join(current_dir, 'chromedriver.exe')
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--remote-debugging-port=9222")
+    
+    # 2. RENDER SPECIFIC
+    if IS_RENDER:
+        chrome_options.add_argument("--headless=new")
+        chrome_options.binary_location = "/usr/bin/chromium"
     else:
-        # Linux/Render locations
-        paths = ["/usr/bin/chromedriver", "/usr/local/bin/chromedriver", os.path.join(current_dir, 'chromedriver')]
-        driver_path = next((p for p in paths if os.path.exists(p)), None)
+        chrome_options.add_argument("--headless=new")
 
-    if not driver_path or not os.path.exists(driver_path):
-        # If local driver not found, try default PATH
-        driver_path = 'chromedriver'
+    if IS_RENDER:
+        print(f"   Binary: /usr/bin/chromium")
 
     try:
-        service = Service(executable_path=driver_path)
-        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver = webdriver.Chrome(options=chrome_options)
         return driver
     except Exception as e:
         print(f"Error starting Chrome: {e}")
         return None
-
-
-# --- HELPER: SMART CONVERSION (WINDOWS/LINUX) ---
-def convert_to_pdf(docx_path, output_dir):
-    """
-    Tries to convert DOCX to PDF using LibreOffice (soffice).
-    Works on both Windows (if installed) and Linux.
-    """
-    print(f"   > Attempting conversion for {os.path.basename(docx_path)}...")
-
-    # Determine the command for LibreOffice
-    soffice_cmd = 'soffice'  # Default for Linux
-
-    if platform.system() == "Windows":
-        # Common Windows Install paths for LibreOffice
-        possible_paths = [
-            r"C:\Program Files\LibreOffice\program\soffice.exe",
-            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"
-        ]
-        found = False
-        for p in possible_paths:
-            if os.path.exists(p):
-                soffice_cmd = p
-                found = True
-                break
-
-        if not found:
-            print("   > Warning: LibreOffice not found in standard Windows paths.")
-            print("   > Skipping conversion. File saved as DOCX.")
-            return False
-
-    try:
-        # Run the conversion command
-        subprocess.run([
-            soffice_cmd,
-            '--headless',
-            '--convert-to', 'pdf',
-            docx_path,
-            '--outdir', output_dir
-        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        # Verify Result
-        base_name = os.path.splitext(os.path.basename(docx_path))[0]
-        expected_pdf = os.path.join(output_dir, base_name + ".pdf")
-
-        if os.path.exists(expected_pdf):
-            print("   > Conversion successful. Deleting DOCX.")
-            os.remove(docx_path)
-            return True
-        else:
-            print("   > Error: LibreOffice ran but PDF was not created.")
-            return False
-
-    except FileNotFoundError:
-        print(f"   > Error: The command '{soffice_cmd}' was not found.")
-        if platform.system() == "Linux":
-            print("   > On Render: Ensure LibreOffice is installed via Dockerfile.")
-        return False
-    except Exception as e:
-        print(f"   > Error during conversion: {e}")
-        return False
 
 
 # --- STEP 1: SEARCH ---
@@ -183,12 +123,17 @@ def get_meeting_links(driver):
                     clean_date = date_match.group(1)
                     d, m, y = clean_date.split('-')
                     iso_date = f"{y}-{m}-{d}"
+                    date_obj = datetime.date(int(y), int(m), int(d))
 
                     link_el = row.find_element(By.CSS_SELECTOR, "a.row-link")
                     href = link_el.get_attribute('href')
 
                     if href and href not in seen_urls:
-                        all_meetings.append((href, iso_date))
+                        all_meetings.append({
+                            "url": href,
+                            "date_str": iso_date,
+                            "date_obj": date_obj
+                        })
                         seen_urls.add(href)
 
                 except StaleElementReferenceException:
@@ -219,15 +164,42 @@ def get_meeting_links(driver):
 
 
 # --- STEP 3: DOWNLOAD ---
-def download_document(driver, meeting_url, date_str):
-    filename_docx = f"{date_str}_glostrup_oekonomiudvalget.docx"
-    filename_pdf = f"{date_str}_glostrup_oekonomiudvalget.pdf"
+def download_document(driver, meeting):
+    date_str = meeting['date_str']
+    meeting_url = meeting['url']
+    date_obj = meeting['date_obj']
 
-    final_path_docx = os.path.join(DOWNLOAD_DIR, filename_docx)
-    final_path_pdf = os.path.join(DOWNLOAD_DIR, filename_pdf)
+    # --- DATE FILTERING ---
+    if date_obj and not scraper_utils.should_scrape(date_obj):
+         # print(f"Skipping {date_str} (Filtered by Date)")
+         return False
 
-    if os.path.exists(final_path_pdf):
-        return
+    # Filenames (we support PDF or DOCX)
+    filename_base = f"{date_str}_glostrup_oekonomiudvalget"
+    
+    # Check if ANY file for this date exists in Wasabi
+    if IS_RENDER:
+        s3 = scraper_utils.get_s3_client()
+        if s3:
+            try:
+                # Check for PDF
+                s3.head_object(Bucket=WASABI_BUCKET, Key=f"{filename_base}.pdf")
+                print(f"Skipping {filename_base}.pdf (Already in Wasabi)")
+                return True
+            except:
+                try:
+                    # Check for DOCX
+                    s3.head_object(Bucket=WASABI_BUCKET, Key=f"{filename_base}.docx")
+                    print(f"Skipping {filename_base}.docx (Already in Wasabi)")
+                    return True
+                except:
+                    pass
+    else:
+        # Local check
+        if os.path.exists(os.path.join(DOWNLOAD_DIR, f"{filename_base}.pdf")):
+             return True
+        if os.path.exists(os.path.join(DOWNLOAD_DIR, f"{filename_base}.docx")):
+             return True
 
     print(f"Processing: {meeting_url} ...")
 
@@ -249,31 +221,40 @@ def download_document(driver, meeting_url, date_str):
             resp.raise_for_status()
 
             content_type = resp.headers.get('Content-Type', '').lower()
-
-            # Determine if we need to save as PDF directly or DOCX
+            
+            # Determine extension
             if 'pdf' in content_type or file_name.endswith('.pdf'):
-                save_path = final_path_pdf
-                needs_conversion = False
+                final_filename = f"{filename_base}.pdf"
             else:
-                save_path = final_path_docx
-                needs_conversion = True
+                final_filename = f"{filename_base}.docx"
 
-            print(f"   > Downloading...")
-            with open(save_path, 'wb') as f:
+            final_path = os.path.join(DOWNLOAD_DIR, final_filename)
+
+            print(f"   > Downloading {final_filename}...")
+            with open(final_path, 'wb') as f:
                 for chunk in resp.iter_content(chunk_size=8192):
                     f.write(chunk)
-
-            # Try conversion
-            if needs_conversion:
-                convert_to_pdf(final_path_docx, DOWNLOAD_DIR)
+            
+            # --- UPLOAD IF ON RENDER ---
+            if IS_RENDER:
+                scraper_utils.upload_to_wasabi(final_path, WASABI_BUCKET, final_filename)
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+            else:
+                print("   > Saved locally.")
+                
+            return True
 
         else:
             print(f"   > Skipped: Button attributes missing.")
+            return False
 
     except TimeoutException:
         print(f"   > Skipped: Download button not found.")
+        return False
     except Exception as e:
         print(f"   > Error: {e}")
+        return False
 
 
 # --- MAIN ---
@@ -283,24 +264,33 @@ def run_glostrup_scraper():
     driver = get_driver()
     if not driver: return
 
-    if not perform_search(driver):
+    try:
+        if not perform_search(driver):
+            return
+
+        meetings = get_meeting_links(driver)
+
+        if not meetings:
+            print("No meetings found.")
+            return
+
+        print(f"\n--- Step 3: Downloading {len(meetings)} Documents ---")
+        
+        download_limit = scraper_utils.get_download_limit()
+        processed_count = 0
+        
+        for i, meeting in enumerate(meetings):
+            if download_limit and processed_count >= download_limit:
+                print(f"Reached download limit ({download_limit}). Stopping.")
+                break
+                
+            print(f"[{i + 1}/{len(meetings)}]", end=" ")
+            if download_document(driver, meeting):
+                processed_count += 1
+                
+    finally:
         driver.quit()
-        return
-
-    meetings = get_meeting_links(driver)
-
-    if not meetings:
-        print("No meetings found.")
-        driver.quit()
-        return
-
-    print(f"\n--- Step 3: Downloading {len(meetings)} Documents ---")
-    for i, (url, date) in enumerate(meetings):
-        print(f"[{i + 1}/{len(meetings)}]", end=" ")
-        download_document(driver, url, date)
-
-    driver.quit()
-    print("\n--- Glostrup Scrape Complete! ---")
+        print("\n--- Glostrup Scrape Complete! ---")
 
 
 if __name__ == "__main__":

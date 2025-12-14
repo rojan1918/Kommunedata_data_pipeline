@@ -1,7 +1,6 @@
 import os
 import time
 import re
-import json
 import datetime
 from glob import glob
 
@@ -23,15 +22,16 @@ except ImportError:
 
 # --- CONFIGURATION ---
 IS_RENDER = os.environ.get('RENDER') == 'true'
-START_URL = "https://norddjurs.meetingsplus.dk/committees/okonomiudvalget"
-BASE_URL = "https://norddjurs.meetingsplus.dk"
-WASABI_BUCKET = "raw-files-norddjurs"
+DOWNLOAD_DIR = os.path.abspath('raw_files_hedensted')
+START_URL = "https://www.hedensted.dk/politik-og-indflydelse/kommunalbestyrelse-og-udvalg/dagsordener-og-referater/oekonomiudvalget-dagsordener-og-referater#agenda7560"
+BASE_URL = "https://www.hedensted.dk"
+WASABI_BUCKET = "raw-files-hedensted"
 
 if IS_RENDER:
     DOWNLOAD_DIR = "/tmp"
     print(f"--- RUNNING ON RENDER (CLOUD MODE) ---")
 else:
-    DOWNLOAD_DIR = os.path.abspath('raw_files_norddjurs')
+    DOWNLOAD_DIR = os.path.abspath('raw_files_hedensted')
     print(f"--- RUNNING LOCALLY ---")
 
 
@@ -53,7 +53,6 @@ def get_driver():
     else:
         chrome_options.add_argument("--headless=new")
 
-    # Force download to our folder
     prefs = {
         "download.default_directory": DOWNLOAD_DIR,
         "download.prompt_for_download": False,
@@ -73,67 +72,73 @@ def get_driver():
         return None
 
 
-# --- STEP 1: FIND MEETING LINKS AND DATES ---
-def get_meeting_info(driver):
-    print(f"--- Step 1: Scraping Meeting List from {START_URL} ---")
+# --- STEP 1: FIND MEETING LINKS ---
+def get_meeting_links(driver):
+    print(f"--- Step 1: Scraping Meeting List ---")
     driver.get(START_URL)
+    time.sleep(2)  # Wait for initial load
 
-    # Wait for the Recent Content container
+    # 1. FORCE OPEN THE ACCORDION
     try:
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.ID, "committeesRecentContent"))
-        )
+        print("   > Locating accordion 'agenda7560'...")
+        wait = WebDriverWait(driver, 10)
+        accordion_container = wait.until(EC.presence_of_element_located((By.ID, "agenda7560")))
+        header_btn = accordion_container.find_element(By.CLASS_NAME, "js-accordion-header")
+        is_expanded = header_btn.get_attribute("aria-expanded")
+
+        if is_expanded != "true":
+            print("   > Accordion is closed. Clicking to open...")
+            driver.execute_script("arguments[0].click();", header_btn)
+            time.sleep(2)  # Wait for list to render
+        else:
+            print("   > Accordion is already open.")
+
+    except Exception as e:
+        print(f"   > Warning: Issue interacting with accordion: {e}")
+
+    # 2. SCRAPE THE LINKS
+    try:
+        links_selector = "#agenda7560 .list__links a.list__link"
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, links_selector)))
+        link_elements = driver.find_elements(By.CSS_SELECTOR, links_selector)
     except TimeoutException:
-        print("Error: Could not load meeting list.")
+        print("Error: No links found inside #agenda7560.")
         return []
 
-    # Find all rows in the recent content
-    links = driver.find_elements(By.CSS_SELECTOR, "#committeesRecentContent a.accessible-table-cell")
+    meetings = []
 
-    meetings = []  # List of dicts
-    seen_urls = set()
+    for el in link_elements:
+        href = el.get_attribute('href')
+        if not href: continue
 
-    for link in links:
-        href = link.get_attribute('href')
-        text = link.text
-
-        # Skip duplicates or invalid links
-        if not href or href in seen_urls:
-            continue
-
-        # Extract Date from text (e.g., "2025-11-04")
-        date_match = re.search(r"(\d{4}-\d{2}-\d{2})", text)
+        # Extract date from URL
+        # Pattern: .../dagsorden/Oekonomiudvalget_2022/10-11-2025...
+        match = re.search(r"/(\d{2}-\d{2}-\d{4})", href)
         date_str = None
-        
-        if date_match:
-            date_str = date_match.group(1)
-        else:
-            # Fallback: Try to get date from aria-label
-            aria = link.get_attribute("aria-label")
-            date_match_aria = re.search(r"(\d{4}-\d{2}-\d{2})", aria if aria else "")
-            if date_match_aria:
-                date_str = date_match_aria.group(1)
-        
-        if date_str:
+        date_obj = None
+
+        if match:
+            date_raw = match.group(1)
+            d, m, y = date_raw.split('-')
+            date_str = f"{y}-{m}-{d}"
             try:
-                y, m, d = map(int, date_str.split('-'))
-                date_obj = datetime.date(y, m, d)
-                
-                meetings.append({
-                    "url": href, 
-                    "date_str": date_str,
-                    "date_obj": date_obj
-                })
-                seen_urls.add(href)
+                date_obj = datetime.date(int(y), int(m), int(d))
             except:
                 pass
+        
+        if date_str:
+            meetings.append({
+                "url": href, 
+                "date_str": date_str,
+                "date_obj": date_obj
+            })
 
-    print(f"  > Found {len(meetings)} unique meetings with dates.")
+    print(f"  > Found {len(meetings)} valid meeting links.")
     return meetings
 
 
 # --- STEP 2: DOWNLOAD PDF ---
-def download_meeting_pdf(driver, meeting):
+def download_pdf(driver, meeting):
     date_str = meeting['date_str']
     meeting_url = meeting['url']
     date_obj = meeting['date_obj']
@@ -143,8 +148,7 @@ def download_meeting_pdf(driver, meeting):
          # print(f"Skipping {date_str} (Filtered by Date)")
          return False
 
-    # 1. Generate Filename
-    filename = f"{date_str}_norddjurs_oekonomiudvalget.pdf"
+    filename = f"{date_str}_hedensted_oekonomiudvalget.pdf"
     local_path = os.path.join(DOWNLOAD_DIR, filename)
 
     # --- CHECK IF EXISTS (Cloud or Local) ---
@@ -161,41 +165,37 @@ def download_meeting_pdf(driver, meeting):
         # print(f"Skipping (Exists): {filename}")
         return True
 
-    # 2. Visit Meeting Page
     driver.get(meeting_url)
 
     try:
-        # 3. Find 'Vis referat' button by ID 'openProtocol'
         wait = WebDriverWait(driver, 5)
-        button = wait.until(EC.presence_of_element_located((By.ID, "openProtocol")))
+        button = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.btn__link.attachment-link")))
 
-        pdf_url = button.get_attribute('href')
+        pdf_href = button.get_attribute('href')
+        if not pdf_href: return False
 
-        # OPTIONAL: Change 'downloadMode=open' to 'downloadMode=download' to be safe
-        if "downloadMode=open" in pdf_url:
-            pdf_url = pdf_url.replace("downloadMode=open", "downloadMode=download")
+        if pdf_href.startswith("/"):
+            pdf_url = BASE_URL + pdf_href
+        else:
+            pdf_url = pdf_href
 
         print(f"Downloading: {filename} ...")
 
-        # 4. Snapshot files before download
         files_before = set(glob(os.path.join(DOWNLOAD_DIR, "*.pdf")))
 
-        # 5. Trigger Download
+        # downloads the file
         driver.get(pdf_url)
 
-        # 6. Wait for file
-        timeout = time.time() + 60
+        timeout = time.time() + 30
         while time.time() < timeout:
             files_now = set(glob(os.path.join(DOWNLOAD_DIR, "*.pdf")))
             new_files = files_now - files_before
 
             if new_files:
                 new_file = new_files.pop()
-                # Wait if it's still a temp file
                 if not new_file.endswith(".crdownload"):
-                    # Rename
-                    time.sleep(1)  # Release lock
-                    # If target exists locally (unlikely due to check above), remove it
+                    time.sleep(1)
+                    # If local file exists, remove
                     if os.path.exists(local_path):
                         os.remove(local_path)
                         
@@ -216,7 +216,7 @@ def download_meeting_pdf(driver, meeting):
         return False
 
     except TimeoutException:
-        print(f"  > Skipped: No 'Vis referat' (openProtocol) button found on {meeting_url}")
+        print(f"  > Skipped: No PDF found on {meeting_url}")
         return False
     except Exception as e:
         print(f"  > Error: {e}")
@@ -224,34 +224,32 @@ def download_meeting_pdf(driver, meeting):
 
 
 # --- MAIN ---
-def run_norddjurs_scraper():
+def run_hedensted_scraper():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     driver = get_driver()
     if not driver: return
 
     try:
-        # 1. Get list of meetings + dates
-        meetings_data = get_meeting_info(driver)
+        links = get_meeting_links(driver)
 
-        # 2. Process downloads
-        print(f"\n--- Step 2: Downloading {len(meetings_data)} PDFs ---")
+        print(f"\n--- Step 2: Downloading {len(links)} PDFs ---")
         
         download_limit = scraper_utils.get_download_limit()
         processed_count = 0
         
-        for i, meeting in enumerate(meetings_data):
+        for i, meeting in enumerate(links):
             if download_limit and processed_count >= download_limit:
                 print(f"Reached download limit ({download_limit}). Stopping.")
                 break
                 
-            print(f"[{i + 1}/{len(meetings_data)}]", end=" ")
-            if download_meeting_pdf(driver, meeting):
+            print(f"[{i + 1}/{len(links)}]", end=" ")
+            if download_pdf(driver, meeting):
                 processed_count += 1
                 
     finally:
         driver.quit()
-        print("\n--- Norddjurs Scrape Complete! ---")
+        print("\n--- Hedensted Scrape Complete! ---")
 
 
 if __name__ == "__main__":
-    run_norddjurs_scraper()
+    run_hedensted_scraper()
