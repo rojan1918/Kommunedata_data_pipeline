@@ -1,0 +1,11 @@
+__pycache__
+venv
+.git
+.gitignore
+.env
+raw_files_*
+referater_*
+*.pdf
+*.docx
+chromedriver.exe
+chromedriver
