@@ -12,6 +12,10 @@ RUN apt-get update && apt-get install -y \
     libgdk-pixbuf2.0-0 \
     libffi-dev \
     shared-mime-info \
+    libglib2.0-0 \
+    libnss3 \
+    libgconf-2-4 \
+    libfontconfig1 \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Set Environment Variables so Selenium finds them automatically
