@@ -7,6 +7,11 @@ RUN apt-get update && apt-get install -y \
     chromium-driver \
     wget \
     unzip \
+    libcairo2 \
+    libpango-1.0-0 \
+    libgdk-pixbuf2.0-0 \
+    libffi-dev \
+    shared-mime-info \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Set Environment Variables so Selenium finds them automatically
@@ -21,10 +26,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 5. Copy script
-COPY scraper_roedovre.py .
-COPY scraper_ishoej.py .
-COPY run_scrapers.py .
+# 5. Copy all project files (respecting .dockerignore)
+COPY . .
 
 # 6. Run
 CMD ["python", "run_scrapers.py"]
