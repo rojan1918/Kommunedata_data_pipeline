@@ -1,25 +1,120 @@
-# local_scraper.py
 import os
 import re
 import time
 import base64
+import json
+import platform
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
-import undetected_chromedriver as uc
-from selenium.webdriver.common.print_page_options import PrintOptions
+
+# --- LIBRARIES ---
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+except ImportError:
+    print("Error: Selenium library not found.")
+    exit()
+
+try:
+    import boto3
+    from botocore.exceptions import NoCredentialsError
+except ImportError:
+    print("Warning: boto3 not found.")
 
 # --- CONFIGURATION ---
-DOWNLOAD_DIR = os.path.abspath('referater_ishoj_local')
+IS_RENDER = os.environ.get('RENDER') == 'true'
 START_URL = 'https://ishoj.dk/borger/demokrati/dagsordener-og-referater/'
 
+WASABI_ACCESS_KEY = os.environ.get("WASABI_ACCESS_KEY")
+WASABI_SECRET_KEY = os.environ.get("WASABI_SECRET_KEY")
+WASABI_BUCKET = "raw-files-ishoej" 
+WASABI_ENDPOINT = os.environ.get("WASABI_ENDPOINT", "https://s3.eu-central-1.wasabisys.com")
 
+if IS_RENDER:
+    DOWNLOAD_DIR = "/tmp"
+    print(f"--- RUNNING ON RENDER (CLOUD MODE) ---")
+else:
+    DOWNLOAD_DIR = os.path.abspath('referater_ishoj_local')
+    print(f"--- RUNNING LOCALLY ---")
+
+
+# --- WASABI HELPER ---
+def upload_to_wasabi(local_file_path, remote_filename):
+    if not WASABI_ACCESS_KEY or not WASABI_SECRET_KEY:
+        print("   > Error: Wasabi credentials missing.")
+        return False
+
+    s3 = boto3.client(
+        's3',
+        endpoint_url=WASABI_ENDPOINT,
+        aws_access_key_id=WASABI_ACCESS_KEY,
+        aws_secret_access_key=WASABI_SECRET_KEY
+    )
+    try:
+        try:
+            s3.head_object(Bucket=WASABI_BUCKET, Key=remote_filename)
+            print(f"   > Skipping: {remote_filename} already exists.")
+            return "EXISTS"
+        except:
+            pass
+
+        print(f"   > Uploading to Wasabi...")
+        with open(local_file_path, "rb") as f:
+            s3.put_object(Bucket=WASABI_BUCKET, Key=remote_filename, Body=f)
+        print(f"   > Upload Success!")
+        return True
+    except Exception as e:
+        print(f"   > Wasabi Upload Error: {e}")
+        return False
+
+
+# --- SETUP SELENIUM (FIXED) ---
 def get_driver():
-    print("Initializing Local Browser...")
-    options = uc.ChromeOptions()
-    options.add_argument("--disable-gpu")
-    # We run visible (NOT headless) to ensure we pass Cloudflare
-    driver = uc.Chrome(options=options, version_main=141)
-    return driver
+    chrome_options = Options()
+
+    # 1. BASIC STABILITY OPTIONS
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    
+    # 2. CRASH FIX: Remote Debugging Port
+    chrome_options.add_argument("--remote-debugging-port=9222")
+    
+    # 3. USER AGENT (Cloudflare Bypassing)
+    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+    # 4. RENDER SPECIFIC
+    if IS_RENDER:
+        chrome_options.add_argument("--headless=new")
+        chrome_options.binary_location = "/usr/bin/chromium"
+
+    # 5. PRINTING PREFS
+    settings = {
+        "recentDestinations": [{"id": "Save as PDF", "origin": "local", "account": ""}],
+        "selectedDestinationId": "Save as PDF",
+        "version": 2
+    }
+    prefs = {
+        'printing.print_preview_sticky_settings.appState': json.dumps(settings),
+        'savefile.default_directory': DOWNLOAD_DIR
+    }
+    chrome_options.add_experimental_option('prefs', prefs)
+
+    print(f"Starting Chrome...")
+    if IS_RENDER:
+        print(f"   Binary: /usr/bin/chromium")
+
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        return driver
+    except Exception as e:
+        print(f"Error starting Chrome: {e}")
+        return None
 
 
 def get_meeting_links(driver):
@@ -76,7 +171,7 @@ def get_meeting_links(driver):
     return links
 
 
-def save_page_as_pdf(driver, url):
+def process_meeting(driver, url):
     try:
         # Extract date for filename (e.g., 18-08-2025)
         date_match = re.search(r'(\d{2}-\d{2}-\d{4})', url)
@@ -86,12 +181,23 @@ def save_page_as_pdf(driver, url):
         else:
             filename = f"ishoj_{url.split('/')[-1][:20]}.pdf"
 
-        final_path = os.path.join(DOWNLOAD_DIR, filename)
-        if os.path.exists(final_path):
-            # print(f"Skipping {filename} (Exists)")
+        local_path = os.path.join(DOWNLOAD_DIR, filename)
+
+        # --- CHECK IF EXISTS (Cloud or Local) ---
+        if IS_RENDER:
+            s3 = boto3.client('s3', endpoint_url=WASABI_ENDPOINT, aws_access_key_id=WASABI_ACCESS_KEY,
+                              aws_secret_access_key=WASABI_SECRET_KEY)
+            try:
+                s3.head_object(Bucket=WASABI_BUCKET, Key=filename)
+                print(f"Skipping {filename} (Already in Wasabi)")
+                return
+            except:
+                pass
+        elif os.path.exists(local_path):
+            print(f"Skipping {filename} (Exists locally)")
             return
 
-        print(f"Processing: {filename}")
+        print(f"Processing: {filename} ...")
         driver.get(url)
         time.sleep(3)  # Wait for load
 
@@ -121,26 +227,37 @@ def save_page_as_pdf(driver, url):
         time.sleep(1)
 
         # 5. PRINT TO PDF
-        result = driver.execute_cdp_cmd("Page.printToPDF", {
-            "landscape": False,
-            "displayHeaderFooter": False,
-            "printBackground": True,
-            "preferCSSPageSize": True,
-        })
+        try:
+            result = driver.execute_cdp_cmd("Page.printToPDF", {
+                "landscape": False,
+                "displayHeaderFooter": False,
+                "printBackground": True,
+                "preferCSSPageSize": True,
+            })
+            
+            with open(local_path, 'wb') as f:
+                f.write(base64.b64decode(result['data']))
+            
+            # --- UPLOAD IF ON RENDER ---
+            if IS_RENDER:
+                upload_to_wasabi(local_path, filename)
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+            else:
+                print("   > Saved locally.")
 
-        with open(final_path, 'wb') as f:
-            f.write(base64.b64decode(result['data']))
-
-        print("  > Saved.")
+        except Exception as e:
+            print(f"   > Error printing/saving PDF: {e}")
 
     except Exception as e:
-        print(f"Error saving PDF: {e}")
+        print(f"Error processing meeting: {e}")
 
 
-if __name__ == "__main__":
+def run_ishoej_scraper():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
     driver = get_driver()
+    if not driver: return
+    
     try:
         links = get_meeting_links(driver)
 
@@ -148,7 +265,7 @@ if __name__ == "__main__":
             print(f"Starting download of {len(links)} files...")
             for i, link in enumerate(links):
                 print(f"[{i + 1}/{len(links)}]", end=" ")
-                save_page_as_pdf(driver, link)
+                process_meeting(driver, link)
         else:
             print("No links found. Check debug_failure.html.")
 
@@ -157,3 +274,7 @@ if __name__ == "__main__":
     finally:
         driver.quit()
         print("\n--- Done ---")
+
+
+if __name__ == "__main__":
+    run_ishoej_scraper()

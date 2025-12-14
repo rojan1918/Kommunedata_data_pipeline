@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
 # 2. Set Environment Variables so Selenium finds them automatically
 ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROME_DRIVER=/usr/bin/chromedriver
+ENV PYTHONUNBUFFERED=1
 
 # 3. Set work directory
 WORKDIR /app
@@ -22,6 +23,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 5. Copy script
 COPY scraper_roedovre.py .
+COPY scraper_ishoej.py .
+COPY run_scrapers.py .
 
 # 6. Run
-CMD ["python", "scraper_roedovre.py"]
+CMD ["python", "run_scrapers.py"]
