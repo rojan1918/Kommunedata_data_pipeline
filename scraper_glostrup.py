@@ -6,7 +6,9 @@ import json
 import datetime
 import platform
 import scraper_utils
+import mammoth
 from urllib.parse import urljoin
+from weasyprint import HTML
 
 # --- LIBRARIES ---
 try:
@@ -34,6 +36,47 @@ if IS_RENDER:
 else:
     DOWNLOAD_DIR = os.path.abspath('raw_files_glostrup')
     print(f"--- RUNNING LOCALLY ---")
+
+
+# --- HELPER: DOCX TO PDF CONVERSION ---
+def convert_docx_to_pdf(docx_path, pdf_path):
+    """
+    Converts DOCX to PDF using Mammoth (to HTML) and WeasyPrint (to PDF).
+    This avoids needing LibreOffice installed.
+    """
+    print(f"   > Converting {os.path.basename(docx_path)} to PDF...")
+    try:
+        # 1. Convert DOCX to HTML
+        with open(docx_path, "rb") as docx_file:
+            result = mammoth.convert_to_html(docx_file)
+            html_content = result.value
+            messages = result.messages
+            
+        # 2. Add basic styling to HTML
+        styled_html = f"""
+        <html>
+        <head>
+            <style>
+                body {{ font-family: sans-serif; margin: 2cm; line-height: 1.5; }}
+                table {{ border-collapse: collapse; width: 100%; }}
+                td, th {{ border: 1px solid #ccc; padding: 8px; }}
+                img {{ max-width: 100%; height: auto; }}
+            </style>
+        </head>
+        <body>
+            {html_content}
+        </body>
+        </html>
+        """
+        
+        # 3. Convert HTML to PDF
+        HTML(string=styled_html).write_pdf(pdf_path)
+        print("   > Conversion successful!")
+        return True
+        
+    except Exception as e:
+        print(f"   > Conversion Failed: {e}")
+        return False
 
 
 # --- SETUP SELENIUM ---
@@ -235,6 +278,19 @@ def download_document(driver, meeting):
                 for chunk in resp.iter_content(chunk_size=8192):
                     f.write(chunk)
             
+            # --- CONVERSION IF NEEDED ---
+            if final_filename.endswith(".docx"):
+                pdf_filename = final_filename.replace(".docx", ".pdf")
+                pdf_path = os.path.join(DOWNLOAD_DIR, pdf_filename)
+                
+                if convert_docx_to_pdf(final_path, pdf_path):
+                    # If conversion success, remove docx and upload PDF
+                    os.remove(final_path)
+                    final_path = pdf_path
+                    final_filename = pdf_filename
+                else:
+                    print("   > Keeping original DOCX due to conversion failure.")
+
             # --- UPLOAD IF ON RENDER ---
             if IS_RENDER:
                 scraper_utils.upload_to_wasabi(final_path, WASABI_BUCKET, final_filename)
