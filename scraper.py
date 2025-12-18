@@ -295,6 +295,15 @@ def run_scraper():
 
         # Generate a folder name based on the URL (e.g., raw_files_esbjerg)
         muni_name = extract_name_from_url(base_url)
+        
+        # --- APPLY FILTER IF SET ---
+        municipality_filter = os.environ.get("MUNICIPALITY_FILTER")
+        if municipality_filter:
+            # Check if this municipality matches the filter string
+            if municipality_filter not in muni_name:
+                # print(f"Skipping {muni_name} (Does not match filter: {municipality_filter})")
+                continue
+
         download_dir = os.path.abspath(f"raw_files_{muni_name}")
         os.makedirs(download_dir, exist_ok=True)
 
