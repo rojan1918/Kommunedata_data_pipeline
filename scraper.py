@@ -300,7 +300,7 @@ def run_scraper():
         municipality_filter = os.environ.get("MUNICIPALITY_FILTER")
         if municipality_filter:
             # Check if this municipality matches the filter string
-            if municipality_filter not in muni_name:
+            if municipality_filter.upper() not in muni_name.upper():
                 # print(f"Skipping {muni_name} (Does not match filter: {municipality_filter})")
                 continue
 

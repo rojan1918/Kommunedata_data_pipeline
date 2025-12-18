@@ -3,6 +3,7 @@ import glob
 import subprocess
 import time
 import sys
+import scraper
 
 def main():
     print("=========================================")
@@ -23,7 +24,27 @@ def main():
     target_filter = os.environ.get("MUNICIPALITY_FILTER")
     if target_filter:
         print(f"Applying filter: '{target_filter}'")
-        scrapers = [s for s in scrapers if target_filter in s]
+
+        # Check CSV (generic scraper) for a match (case-insensitive)
+        has_generic_match = False
+        try:
+            targets = scraper.get_municipalities_from_file()
+            for target in targets:
+                base_url = target['base_url']
+                muni_name = scraper.extract_name_from_url(base_url)
+                if target_filter.upper() in muni_name.upper():
+                    has_generic_match = True
+                    break
+        except Exception:
+            pass
+
+        # Case-insensitive match on filenames for specific scrapers
+        scrapers = [s for s in scrapers if target_filter.lower() in s.lower()]
+
+        # If CSV matched, ensure generic scraper runs
+        if has_generic_match and "scraper.py" not in scrapers:
+            scrapers.append("scraper.py")
+
         if not scrapers:
             print(f"No scrapers found matching '{target_filter}'")
             return
