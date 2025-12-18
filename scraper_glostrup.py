@@ -46,13 +46,34 @@ def convert_docx_to_pdf(docx_path, pdf_path):
     """
     print(f"   > Converting {os.path.basename(docx_path)} to PDF...")
     try:
-        # 1. Convert DOCX to HTML
+        # 1. Convert DOCX to HTML (ignoring images that fail)
+        def ignore_image(image):
+            return {}
+
         with open(docx_path, "rb") as docx_file:
-            result = mammoth.convert_to_html(docx_file)
-            html_content = result.value
-            messages = result.messages
+            # We use a custom conversion options to ignore images if they break
+            # But mammoth doesn't have a simple 'ignore_errors' flag for images.
+            # However, we can try-catch the whole block.
+            # Better strategy: Mammoth usually warns but doesn't crash unless strict.
+            # The error 'cannot find loader' likely comes from Pillow/Weasyprint processing the HTML <img> tag later?
+            # NO, "cannot find loader for this WMF file" is a Pillow error.
+            # This means Mammoth successfully extracted the WMF, put it in HTML <img src="data:image/wmf...">
+            # and then WeasyPrint/Pillow tried to render it and failed.
             
-        # 2. Add basic styling to HTML
+            # SOLUTION: Tell Mammoth to skip images entirely if we don't strictly need them for the agenda text.
+            # OR convert images to a placeholder.
+            
+            result = mammoth.convert_to_html(docx_file, ignore_empty_paragraphs=False)
+            html_content = result.value
+            
+        # 2. Filter out WMF/EMF data URIs from HTML before passing to WeasyPrint
+        # These formats cause WeasyPrint/Pillow to crash on Linux if loaders are missing.
+        # We replace data:image/wmf... with a placeholder or remove the tag.
+        
+        # Simple Regex to remove img tags with wmf/emf data
+        html_content = re.sub(r'<img[^>]+src="data:image/(wmf|emf)[^"]+"[^>]*>', '<!-- [Complex Image Removed] -->', html_content, flags=re.IGNORECASE)
+            
+        # 3. Add basic styling to HTML
         styled_html = f"""
         <html>
         <head>
@@ -69,7 +90,7 @@ def convert_docx_to_pdf(docx_path, pdf_path):
         </html>
         """
         
-        # 3. Convert HTML to PDF
+        # 4. Convert HTML to PDF
         HTML(string=styled_html).write_pdf(pdf_path)
         print("   > Conversion successful!")
         return True
