@@ -32,7 +32,8 @@ except ImportError:
 
 # --- CONFIGURATION ---
 INPUT_FILE = 'found_start_urls.csv'  # The file containing the links
-MAX_DOWNLOADS = 1  # Set to None for "everything", or an integer (e.g. 10) for a limit
+# Pull limit from env via shared helper (None means unlimited)
+MAX_DOWNLOADS = scraper_utils.get_download_limit()
 BASE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 }
