@@ -31,7 +31,12 @@ except ImportError:
     exit()
 
 # --- CONFIGURATION ---
-INPUT_FILE = 'found_start_urls.csv'  # The file containing the links
+INPUT_FILE = 'found_start_urls.csv'  # Default file
+COMMITTEE_SOURCE = os.environ.get('COMMITTEE_SOURCE')
+
+if COMMITTEE_SOURCE == 'Teknik':
+    INPUT_FILE = 'found_start_urls_teknikmiljoe.csv'
+
 # Pull limit from env via shared helper (None means unlimited)
 MAX_DOWNLOADS = scraper_utils.get_download_limit()
 BASE_HEADERS = {
@@ -177,7 +182,10 @@ def process_download(driver, meeting_url, base_url, download_dir, muni_name):
 
         # Determine Paths
         local_path = os.path.join(download_dir, filename)
-        bucket_name = f"raw-files-{muni_name}".replace('_', '-') # S3 buckets usually dash, not underscore
+        
+        # Modify bucket name based on committee source
+        bucket_suffix = "-teknikmiljoe" if COMMITTEE_SOURCE == "Teknik" else ""
+        bucket_name = f"raw-files-{muni_name}{bucket_suffix}".replace('_', '-') # S3 buckets usually dash, not underscore
 
         # --- CHECK EXISTENCE (Cloud or Local) ---
         if IS_RENDER:
@@ -304,8 +312,10 @@ def run_scraper():
             if municipality_filter.upper() not in muni_name.upper():
                 # print(f"Skipping {muni_name} (Does not match filter: {municipality_filter})")
                 continue
-
-        download_dir = os.path.abspath(f"raw_files_{muni_name}")
+        
+        # Modify local folder name based on committee source
+        dir_suffix = "_teknikmiljoe" if COMMITTEE_SOURCE == "Teknik" else ""
+        download_dir = os.path.abspath(f"raw_files_{muni_name}{dir_suffix}")
         os.makedirs(download_dir, exist_ok=True)
 
         print(f"[*] Processing: {muni_name.upper()}")
