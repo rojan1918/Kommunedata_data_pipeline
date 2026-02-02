@@ -36,6 +36,10 @@ COMMITTEE_SOURCE = os.environ.get('COMMITTEE_SOURCE')
 
 if COMMITTEE_SOURCE == 'Teknik':
     INPUT_FILE = 'found_start_urls_teknikmiljoe.csv'
+elif COMMITTEE_SOURCE == 'Byraad':
+    INPUT_FILE = 'found_start_urls_byraad.csv'
+elif COMMITTEE_SOURCE == 'Plan':
+    INPUT_FILE = 'found_start_urls_plan.csv'
 
 # Pull limit from env via shared helper (None means unlimited)
 MAX_DOWNLOADS = scraper_utils.get_download_limit()
@@ -184,7 +188,14 @@ def process_download(driver, meeting_url, base_url, download_dir, muni_name):
         local_path = os.path.join(download_dir, filename)
         
         # Modify bucket name based on committee source
-        bucket_suffix = "-teknikmiljoe" if COMMITTEE_SOURCE == "Teknik" else ""
+        bucket_suffix = ""
+        if COMMITTEE_SOURCE == "Teknik":
+            bucket_suffix = "-teknikmiljoe"
+        elif COMMITTEE_SOURCE == "Byraad":
+            bucket_suffix = "-byraad"
+        elif COMMITTEE_SOURCE == "Plan":
+            bucket_suffix = "-plan"
+            
         bucket_name = f"raw-files-{muni_name}{bucket_suffix}".replace('_', '-') # S3 buckets usually dash, not underscore
 
         # --- CHECK EXISTENCE (Cloud or Local) ---
@@ -314,7 +325,14 @@ def run_scraper():
                 continue
         
         # Modify local folder name based on committee source
-        dir_suffix = "_teknikmiljoe" if COMMITTEE_SOURCE == "Teknik" else ""
+        dir_suffix = ""
+        if COMMITTEE_SOURCE == "Teknik":
+            dir_suffix = "_teknikmiljoe"
+        elif COMMITTEE_SOURCE == "Byraad":
+            dir_suffix = "_byraad"
+        elif COMMITTEE_SOURCE == "Plan":
+            dir_suffix = "_plan"
+
         download_dir = os.path.abspath(f"raw_files_{muni_name}{dir_suffix}")
         os.makedirs(download_dir, exist_ok=True)
 
