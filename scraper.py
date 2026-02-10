@@ -31,7 +31,7 @@ except ImportError:
     exit()
 
 # --- CONFIGURATION ---
-# --- CONFIGURATION ---
+
 COMMITTEE_CONFIGS = {
     'Oekonomi': 'found_start_urls.csv',
     'Teknik': 'found_start_urls_teknikmiljoe.csv',
@@ -199,8 +199,10 @@ def process_download(driver, meeting_url, base_url, download_dir, muni_name, com
         # Construct Direct Download Link
         direct_download_url = f"{base_url.rstrip('/')}/pdf/GetDagsorden/{uuid}"
         
-        # S3 Remote Filename: Append source URL with &&
-        remote_filename = f"{filename}&&{direct_download_url}"
+        # S3 Remote Filename: Insert source URL before extension
+        # e.g., "my_file&&https://.../foo.pdf" instead of "my_file.pdf&&https://..."
+        name_root, name_ext = os.path.splitext(filename)
+        remote_filename = f"{name_root}&&{direct_download_url}{name_ext}"
 
         # --- CHECK EXISTENCE (Cloud or Local) ---
         if IS_RENDER:
