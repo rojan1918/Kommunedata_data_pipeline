@@ -31,15 +31,13 @@ except ImportError:
     exit()
 
 # --- CONFIGURATION ---
-INPUT_FILE = 'found_start_urls.csv'  # Default file
-COMMITTEE_SOURCE = os.environ.get('COMMITTEE_SOURCE')
-
-if COMMITTEE_SOURCE == 'Teknik':
-    INPUT_FILE = 'found_start_urls_teknikmiljoe.csv'
-elif COMMITTEE_SOURCE == 'Byraad':
-    INPUT_FILE = 'found_start_urls_byraad.csv'
-elif COMMITTEE_SOURCE == 'Plan':
-    INPUT_FILE = 'found_start_urls_plan.csv'
+# --- CONFIGURATION ---
+COMMITTEE_CONFIGS = {
+    'Oekonomi': 'found_start_urls.csv',
+    'Teknik': 'found_start_urls_teknikmiljoe.csv',
+    'Byraad': 'found_start_urls_byraad.csv',
+    'Plan': 'found_start_urls_plan.csv'
+}
 
 # Pull limit from env via shared helper (None means unlimited)
 MAX_DOWNLOADS = scraper_utils.get_download_limit()
@@ -153,7 +151,7 @@ def get_meeting_links(driver, start_url, base_url):
     return ordered_links
 
 
-def process_download(driver, meeting_url, base_url, download_dir, muni_name):
+def process_download(driver, meeting_url, base_url, download_dir, muni_name, committee_source):
     """
     Downloads a single PDF.
     Uses the dynamic base_url to construct the download link.
@@ -189,11 +187,11 @@ def process_download(driver, meeting_url, base_url, download_dir, muni_name):
         
         # Modify bucket name based on committee source
         bucket_suffix = ""
-        if COMMITTEE_SOURCE == "Teknik":
+        if committee_source == "Teknik":
             bucket_suffix = "-teknikmiljoe"
-        elif COMMITTEE_SOURCE == "Byraad":
+        elif committee_source == "Byraad":
             bucket_suffix = "-byraad"
-        elif COMMITTEE_SOURCE == "Plan":
+        elif committee_source == "Plan":
             bucket_suffix = "-plan"
             
         bucket_name = f"raw-files-{muni_name}{bucket_suffix}".replace('_', '-') # S3 buckets usually dash, not underscore
@@ -273,12 +271,12 @@ def process_download(driver, meeting_url, base_url, download_dir, muni_name):
         print(f"     Error processing URL: {e}")
 
 
-def get_municipalities_from_file():
+def get_municipalities_from_file(input_file):
     """Reads the CSV file and returns a list of dicts."""
     municipalities = []
     try:
         # Try reading with pandas if available (more robust CSV parsing)
-        df = pd.read_csv(INPUT_FILE)
+        df = pd.read_csv(input_file)
         for _, row in df.iterrows():
             municipalities.append({
                 'base_url': row['Base URL'].strip(),
@@ -286,7 +284,7 @@ def get_municipalities_from_file():
             })
     except Exception:
         # Fallback to standard CSV
-        with open(INPUT_FILE, 'r', encoding='utf-8') as f:
+        with open(input_file, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
                 municipalities.append({
@@ -309,70 +307,88 @@ def extract_name_from_url(url):
 # --- MAIN ORCHESTRATOR ---
 def run_scraper():
     print(f"--- Starting Multi-Municipality Scraper ---")
-    print(f"Reading from: {INPUT_FILE}")
+    
+    # Determine which sources to run
+    env_source = os.environ.get('COMMITTEE_SOURCE')
+    sources_to_run = {}
+    
+    if env_source:
+        if env_source in COMMITTEE_CONFIGS:
+             sources_to_run[env_source] = COMMITTEE_CONFIGS[env_source]
+        else:
+             print(f"Warning: Unknown COMMITTEE_SOURCE '{env_source}'. Valid: {list(COMMITTEE_CONFIGS.keys())}")
+             return
+    else:
+        sources_to_run = COMMITTEE_CONFIGS
+
+    print(f"Sources to run: {list(sources_to_run.keys())}")
     print(f"Download Limit: {MAX_DOWNLOADS if MAX_DOWNLOADS else 'Unlimited'}")
 
-    targets = get_municipalities_from_file()
-    print(f"Found {len(targets)} municipalities to process.\n")
+    for source_name, input_file in sources_to_run.items():
+        print(f"\n=== Processing Source: {source_name} ===")
+        print(f"Reading from: {input_file}")
 
-    for target in targets:
-        base_url = target['base_url']
-        start_url = target['start_url']
+        targets = get_municipalities_from_file(input_file)
+        print(f"Found {len(targets)} municipalities to process.\n")
 
-        # Generate a folder name based on the URL (e.g., raw_files_esbjerg)
-        muni_name = extract_name_from_url(base_url)
-        
-        # --- APPLY FILTER IF SET ---
-        municipality_filter = os.environ.get("MUNICIPALITY_FILTER")
-        if municipality_filter:
-            # Check if this municipality matches the filter string
-            if municipality_filter.upper() not in muni_name.upper():
-                # print(f"Skipping {muni_name} (Does not match filter: {municipality_filter})")
-                continue
-        
-        # Modify local folder name based on committee source
-        dir_suffix = ""
-        if COMMITTEE_SOURCE == "Teknik":
-            dir_suffix = "_teknikmiljoe"
-        elif COMMITTEE_SOURCE == "Byraad":
-            dir_suffix = "_byraad"
-        elif COMMITTEE_SOURCE == "Plan":
-            dir_suffix = "_plan"
+        for target in targets:
+            base_url = target['base_url']
+            start_url = target['start_url']
 
-        download_dir = os.path.abspath(f"raw_files_{muni_name}{dir_suffix}")
-        os.makedirs(download_dir, exist_ok=True)
+            # Generate a folder name based on the URL (e.g., raw_files_esbjerg)
+            muni_name = extract_name_from_url(base_url)
+            
+            # --- APPLY FILTER IF SET ---
+            municipality_filter = os.environ.get("MUNICIPALITY_FILTER")
+            if municipality_filter:
+                # Check if this municipality matches the filter string
+                if municipality_filter.upper() not in muni_name.upper():
+                    # print(f"Skipping {muni_name} (Does not match filter: {municipality_filter})")
+                    continue
+            
+            # Modify local folder name based on committee source
+            dir_suffix = ""
+            if source_name == "Teknik":
+                dir_suffix = "_teknikmiljoe"
+            elif source_name == "Byraad":
+                dir_suffix = "_byraad"
+            elif source_name == "Plan":
+                dir_suffix = "_plan"
 
-        print(f"[*] Processing: {muni_name.upper()}")
-        print(f"    Folder: {download_dir}")
+            download_dir = os.path.abspath(f"raw_files_{muni_name}{dir_suffix}")
+            os.makedirs(download_dir, exist_ok=True)
 
-        # Start a fresh driver for this municipality to ensure clean download folder
-        driver = get_driver(download_dir)
+            print(f"[*] Processing: {muni_name.upper()} ({source_name})")
+            print(f"    Folder: {download_dir}")
 
-        try:
-            # 1. Get Links
-            meeting_links = get_meeting_links(driver, start_url, base_url)
+            # Start a fresh driver for this municipality to ensure clean download folder
+            driver = get_driver(download_dir)
 
-            if not meeting_links:
-                print("    No links found. Skipping.")
-                continue
+            try:
+                # 1. Get Links
+                meeting_links = get_meeting_links(driver, start_url, base_url)
 
-            # Apply limit if set
-            if MAX_DOWNLOADS:
-                meeting_links = meeting_links[:MAX_DOWNLOADS]
+                if not meeting_links:
+                    print("    No links found. Skipping.")
+                    continue
 
-            print(f"    Processing {len(meeting_links)} files...")
+                # Apply limit if set
+                if MAX_DOWNLOADS:
+                    meeting_links = meeting_links[:MAX_DOWNLOADS]
 
-            # 2. Download Loop
-            for i, link in enumerate(meeting_links):
-                print(f"    [{i + 1}/{len(meeting_links)}]", end="")
-                process_download(driver, link, base_url, download_dir, muni_name)
+                print(f"    Processing {len(meeting_links)} files...")
 
-        except Exception as e:
-            print(f"    Critical error for {muni_name}: {e}")
-        finally:
-            driver.quit()
+                # 2. Download Loop
+                for i, link in enumerate(meeting_links):
+                    print(f"    [{i + 1}/{len(meeting_links)}]", end="")
+                    process_download(driver, link, base_url, download_dir, muni_name, source_name)
 
-        print(f"    Finished {muni_name}.\n")
+            except Exception as e:
+                print(f"    Critical error for {muni_name}: {e}")
+            finally:
+                driver.quit()
+
+            print(f"    Finished {muni_name} ({source_name}).\n")
 
     print("--- All Jobs Complete ---")
 
