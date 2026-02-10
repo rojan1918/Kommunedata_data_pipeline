@@ -25,17 +25,22 @@ def main():
     if target_filter:
         print(f"Applying filter: '{target_filter}'")
 
-        # Check CSV (generic scraper) for a match (case-insensitive)
+        # Check CSVs (generic scraper) for a match (case-insensitive)
         has_generic_match = False
         try:
-            targets = scraper.get_municipalities_from_file()
-            for target in targets:
-                base_url = target['base_url']
-                muni_name = scraper.extract_name_from_url(base_url)
-                if target_filter.upper() in muni_name.upper():
-                    has_generic_match = True
+            # Check all configured CSV files
+            for input_file in scraper.COMMITTEE_CONFIGS.values():
+                targets = scraper.get_municipalities_from_file(input_file)
+                for target in targets:
+                    base_url = target['base_url']
+                    muni_name = scraper.extract_name_from_url(base_url)
+                    if target_filter.upper() in muni_name.upper():
+                        has_generic_match = True
+                        break
+                if has_generic_match:
                     break
-        except Exception:
+        except Exception as e:
+            print(f"Error checking generic scraper: {e}")
             pass
 
         # Case-insensitive match on filenames for specific scrapers
