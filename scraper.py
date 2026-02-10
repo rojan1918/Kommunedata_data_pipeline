@@ -198,13 +198,20 @@ def process_download(driver, meeting_url, base_url, download_dir, muni_name):
             
         bucket_name = f"raw-files-{muni_name}{bucket_suffix}".replace('_', '-') # S3 buckets usually dash, not underscore
 
+        # Construct Direct Download Link
+        direct_download_url = f"{base_url.rstrip('/')}/pdf/GetDagsorden/{uuid}"
+        
+        # S3 Remote Filename: Append source URL with &&
+        remote_filename = f"{filename}&&{direct_download_url}"
+
         # --- CHECK EXISTENCE (Cloud or Local) ---
         if IS_RENDER:
              # Check Wasabi first
              s3 = scraper_utils.get_s3_client()
              try:
-                 s3.head_object(Bucket=bucket_name, Key=filename)
-                 print(f"     Skipping {filename} (Already in Wasabi)")
+                 # Check for the remote filename (which includes the URL)
+                 s3.head_object(Bucket=bucket_name, Key=remote_filename)
+                 print(f"     Skipping {remote_filename} (Already in Wasabi)")
                  return
              except:
                  pass
@@ -212,8 +219,6 @@ def process_download(driver, meeting_url, base_url, download_dir, muni_name):
              # print(f"     Skipping (Exists): {filename}")
              return
 
-        # Construct Direct Download Link
-        direct_download_url = f"{base_url.rstrip('/')}/pdf/GetDagsorden/{uuid}"
 
         print(f"     Downloading: {filename} ...")
         
@@ -252,7 +257,8 @@ def process_download(driver, meeting_url, base_url, download_dir, muni_name):
                 
                 # --- UPLOAD IF ON RENDER ---
                 if IS_RENDER:
-                    scraper_utils.upload_to_wasabi(local_path, bucket_name, filename)
+                    # Upload using the new remote_filename
+                    scraper_utils.upload_to_wasabi(local_path, bucket_name, remote_filename)
                     if os.path.exists(local_path):
                         os.remove(local_path)
                 else:
