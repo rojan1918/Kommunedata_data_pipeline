@@ -202,7 +202,9 @@ def process_download(driver, meeting_url, base_url, download_dir, muni_name, com
         # S3 Remote Filename: Insert source URL before extension
         # e.g., "my_file&&https://.../foo.pdf" instead of "my_file.pdf&&https://..."
         name_root, name_ext = os.path.splitext(filename)
-        remote_filename = f"{name_root}&&{direct_download_url}{name_ext}"
+        # Sanitize URL: Replace '/' with '@' to avoid S3 folder creation
+        sanitized_url = direct_download_url.replace('/', '@')
+        remote_filename = f"{name_root}&&{sanitized_url}{name_ext}"
 
         # --- CHECK EXISTENCE (Cloud or Local) ---
         if IS_RENDER:
