@@ -21,37 +21,46 @@ def main():
     scrapers.sort()
     
     # 2. Filter by Municipality if MUNICIPALITY_FILTER is set
-    target_filter = os.environ.get("MUNICIPALITY_FILTER")
-    if target_filter:
-        print(f"Applying filter: '{target_filter}'")
+    target_filter_env = os.environ.get("MUNICIPALITY_FILTER")
+    if target_filter_env:
+        # Split by comma and clean whitespace (e.g. "roskilde, svendborg" -> ["roskilde", "svendborg"])
+        filters = [f.strip().lower() for f in target_filter_env.split(",") if f.strip()]
+        
+        print(f"Applying filters: {filters}")
 
-        # Check CSVs (generic scraper) for a match (case-insensitive)
+        # Check CSV (generic scraper) for a match (case-insensitive)
         has_generic_match = False
         try:
             # Check all configured CSV files
-            for input_file in scraper.COMMITTEE_CONFIGS.values():
-                targets = scraper.get_municipalities_from_file(input_file)
-                for target in targets:
-                    base_url = target['base_url']
-                    muni_name = scraper.extract_name_from_url(base_url)
-                    if target_filter.upper() in muni_name.upper():
-                        has_generic_match = True
-                        break
-                if has_generic_match:
+            targets = scraper.get_municipalities_from_file() # Use default or specific if needed
+            # Since scraper.py defines INPUT_FILE, we can just call it directly.
+            # But wait, scraper.py might have been updated to support multiple.
+            # Let's rely on what scraper.py exposes.
+            
+            # Re-reading scraper.py implies INPUT_FILE is hardcoded there.
+            # Let's check scraper.py content if needed, but for now assuming get_municipalities_from_file works.
+            targets = scraper.get_municipalities_from_file()
+            for target in targets:
+                base_url = target['base_url']
+                muni_name = scraper.extract_name_from_url(base_url).lower()
+                
+                # Check if ANY filter matches this municipality
+                if any(f in muni_name for f in filters):
+                    has_generic_match = True
                     break
-        except Exception as e:
-            print(f"Error checking generic scraper: {e}")
+        except Exception:
             pass
 
         # Case-insensitive match on filenames for specific scrapers
-        scrapers = [s for s in scrapers if target_filter.lower() in s.lower()]
+        # Keep scraper if ANY filter matches its filename
+        scrapers = [s for s in scrapers if any(f in s.lower() for f in filters)]
 
         # If CSV matched, ensure generic scraper runs
         if has_generic_match and "scraper.py" not in scrapers:
             scrapers.append("scraper.py")
 
         if not scrapers:
-            print(f"No scrapers found matching '{target_filter}'")
+            print(f"No scrapers found matching filters: {filters}")
             return
 
     print(f"Found {len(scrapers)} scrapers: {', '.join(scrapers)}\n")
