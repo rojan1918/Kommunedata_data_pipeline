@@ -355,15 +355,15 @@ def run_scraper():
 
         # Modify local folder name based on committee source
         dir_suffix = ""
-            if source_name == "Teknik":
-                dir_suffix = "_teknikmiljoe"
-            elif source_name == "Byraad":
-                dir_suffix = "_byraad"
-            elif source_name == "Plan":
-                dir_suffix = "_plan"
+        if source_name == "Teknik":
+            dir_suffix = "_teknikmiljoe"
+        elif source_name == "Byraad":
+            dir_suffix = "_byraad"
+        elif source_name == "Plan":
+            dir_suffix = "_plan"
 
-            download_dir = os.path.abspath(f"raw_files_{muni_name}{dir_suffix}")
-            os.makedirs(download_dir, exist_ok=True)
+        download_dir = os.path.abspath(f"raw_files_{muni_name}{dir_suffix}")
+        os.makedirs(download_dir, exist_ok=True)
 
             print(f"[*] Processing: {muni_name.upper()} ({source_name})")
             print(f"    Folder: {download_dir}")
