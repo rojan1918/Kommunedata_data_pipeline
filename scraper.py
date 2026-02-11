@@ -335,23 +335,26 @@ def run_scraper():
         targets = get_municipalities_from_file(input_file)
         print(f"Found {len(targets)} municipalities to process.\n")
 
-        for target in targets:
-            base_url = target['base_url']
-            start_url = target['start_url']
+    for target in targets:
+        base_url = target['base_url']
+        start_url = target['start_url']
 
-            # Generate a folder name based on the URL (e.g., raw_files_esbjerg)
-            muni_name = extract_name_from_url(base_url)
+        # Generate a folder name based on the URL (e.g., raw_files_esbjerg)
+        muni_name = extract_name_from_url(base_url)
+        
+        # --- APPLY FILTER IF SET ---
+        municipality_filter_env = os.environ.get("MUNICIPALITY_FILTER")
+        if municipality_filter_env:
+            # Split and check if ANY filter matches
+            filters = [f.strip().lower() for f in municipality_filter_env.split(",") if f.strip()]
             
-            # --- APPLY FILTER IF SET ---
-            municipality_filter = os.environ.get("MUNICIPALITY_FILTER")
-            if municipality_filter:
-                # Check if this municipality matches the filter string
-                if municipality_filter.upper() not in muni_name.upper():
-                    # print(f"Skipping {muni_name} (Does not match filter: {municipality_filter})")
-                    continue
-            
-            # Modify local folder name based on committee source
-            dir_suffix = ""
+            # Check if this municipality matches ANY of the filters
+            if not any(f in muni_name.lower() for f in filters):
+                # print(f"Skipping {muni_name} (Does not match filters: {filters})")
+                continue
+
+        # Modify local folder name based on committee source
+        dir_suffix = ""
             if source_name == "Teknik":
                 dir_suffix = "_teknikmiljoe"
             elif source_name == "Byraad":
